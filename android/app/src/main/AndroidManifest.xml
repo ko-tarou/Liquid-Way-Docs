@@ -21,15 +21,6 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-
-            <!-- Debug smoke entrypoint:
-                 adb shell am start -n ai.liquidway.lfmsmoke/.MainActivity \
-                   -e smoke_prompt "Say hello in one short sentence."
-                 Result is logged to logcat under tag "LfmSmoke". -->
-            <intent-filter>
-                <action android:name="ai.liquidway.lfmsmoke.RUN_SMOKE" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
         </activity>
     </application>
 
