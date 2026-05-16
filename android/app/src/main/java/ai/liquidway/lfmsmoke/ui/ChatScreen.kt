@@ -1,6 +1,8 @@
 package ai.liquidway.lfmsmoke.ui
 
 import ai.liquidway.lfmsmoke.data.Message
+import ai.liquidway.lfmsmoke.net.MeshState
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -50,6 +52,7 @@ fun ChatScreen(
 ) {
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val deviceId by viewModel.deviceId.collectAsStateWithLifecycle()
+    val meshState by viewModel.meshState.collectAsStateWithLifecycle()
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
@@ -74,6 +77,8 @@ fun ChatScreen(
         },
     ) { inner ->
         Column(modifier = Modifier.fillMaxSize().padding(inner)) {
+            MeshStatusBar(meshState)
+
             if (messages.isEmpty()) {
                 Box(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
@@ -128,6 +133,57 @@ fun ChatScreen(
                 }
             }
         }
+    }
+}
+
+/**
+ * Thin colour-coded banner reflecting layer-2 connectivity. Green = a working
+ * link (hub with peers / connected leaf), amber = transient, neutral = idle.
+ */
+@Composable
+private fun MeshStatusBar(state: MeshState) {
+    val (label, container, onContainer) = when (state) {
+        is MeshState.Idle -> Triple(
+            "Mesh idle",
+            MaterialTheme.colorScheme.surfaceVariant,
+            MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        is MeshState.Hub -> Triple(
+            if (state.peerCount > 0) {
+                "Hub · ${state.peerCount} peer(s) connected"
+            } else {
+                "Hub · waiting for peers"
+            },
+            MaterialTheme.colorScheme.primaryContainer,
+            MaterialTheme.colorScheme.onPrimaryContainer,
+        )
+        is MeshState.Connecting -> Triple(
+            "Connecting to ${state.host}…",
+            MaterialTheme.colorScheme.tertiaryContainer,
+            MaterialTheme.colorScheme.onTertiaryContainer,
+        )
+        is MeshState.Connected -> Triple(
+            "Connected to ${state.host}",
+            MaterialTheme.colorScheme.primaryContainer,
+            MaterialTheme.colorScheme.onPrimaryContainer,
+        )
+        is MeshState.Disconnected -> Triple(
+            "Disconnected · ${state.reason}",
+            MaterialTheme.colorScheme.errorContainer,
+            MaterialTheme.colorScheme.onErrorContainer,
+        )
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(container)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = onContainer,
+        )
     }
 }
 

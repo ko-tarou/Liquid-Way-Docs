@@ -24,6 +24,9 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     val deviceName: StateFlow<String> = settings.deviceName
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "")
 
+    val serverHost: StateFlow<String> = settings.serverHost
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "")
+
     val deviceId: StateFlow<String> = kotlinx.coroutines.flow.flow {
         emit(settings.deviceId())
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "")
@@ -34,5 +37,9 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setDeviceName(name: String) {
         viewModelScope.launch { settings.setDeviceName(name) }
+    }
+
+    fun setServerHost(host: String) {
+        viewModelScope.launch { settings.setServerHost(host) }
     }
 }
