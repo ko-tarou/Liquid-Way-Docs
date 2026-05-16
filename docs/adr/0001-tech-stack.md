@@ -56,6 +56,7 @@
 - **直ネイティブ実行を最優先で試行** する
 - 動かない / 統合が重い場合は **Lemonade SDK（OpenAI 互換 API）** にフォールバック
 - NPU 効率を最大化したい場合は **FastFlowLM** を試す
+- 補足（ADR-0006 による具体化）: Android 実行先（昇格端末）での「直」の具体は **llama.cpp（GGUF 量子化）**。Ryzen AI PC 側は FastFlowLM、Android 側は llama.cpp と**実行先で使い分ける**（詳細は ADR-0006）。
 
 ---
 
