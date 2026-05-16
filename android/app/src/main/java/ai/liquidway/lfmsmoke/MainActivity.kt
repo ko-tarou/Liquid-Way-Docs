@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -30,8 +31,10 @@ class MainActivity : ComponentActivity() {
                 val state by vm.state.collectAsState()
 
                 // Auto-run once if launched with a smoke prompt extra.
-                if (smokePrompt != null) {
-                    androidx.compose.runtime.LaunchedEffect(Unit) {
+                // LaunchedEffect is called unconditionally (keyed on the
+                // prompt) to respect the rules of composition.
+                LaunchedEffect(smokePrompt) {
+                    if (smokePrompt != null) {
                         vm.runSmoke(smokePrompt)
                     }
                 }
