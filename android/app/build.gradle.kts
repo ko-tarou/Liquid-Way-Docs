@@ -43,6 +43,14 @@ android {
     buildFeatures {
         compose = true
     }
+
+    testOptions {
+        unitTests {
+            // android.util.Log etc. return defaults instead of throwing, so
+            // the JVM relay test can exercise the real transport classes.
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 kotlin {
@@ -87,4 +95,11 @@ dependencies {
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.room:room-testing:2.8.4")
     androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+
+    // Local JVM tests: deterministic proof of the wire protocol + star relay
+    // over real JVM loopback sockets, independent of the flaky emulator net
+    // stack. A real org.json impl replaces the empty android.jar stub.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    testImplementation("org.json:json:20240303")
 }
