@@ -63,4 +63,20 @@ class LeapSummarizationEngine(
             }
         }
     }
+
+    /**
+     * Unloads the underlying LFM under the same [gate] that serialises
+     * load/generate, so a release can never race a summary in flight: it
+     * waits for the current generation to finish, then frees the model and
+     * clears [loaded] so the next [summarize] lazily reloads. Best-effort
+     * (see [LfmEngine.unload]); never throws.
+     */
+    override suspend fun release() {
+        gate.withLock {
+            if (!loaded) return
+            Log.i(TAG, "Releasing idle LFM model")
+            engine.unload()
+            loaded = false
+        }
+    }
 }
