@@ -1,0 +1,38 @@
+package ai.liquidway.lfmsmoke.ui
+
+import ai.liquidway.lfmsmoke.data.Message
+import ai.liquidway.lfmsmoke.data.MessageRepository
+import ai.liquidway.lfmsmoke.settings.SettingsRepository
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+
+class ChatViewModel(app: Application) : AndroidViewModel(app) {
+
+    private val repository = MessageRepository.get(app)
+    private val settings = SettingsRepository.get(app)
+
+    val messages: StateFlow<List<Message>> = repository.messages
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = emptyList(),
+        )
+
+    /** This device's stable id, used by the UI to align bubbles (self/other). */
+    val deviceId: StateFlow<String> = kotlinx.coroutines.flow.flow {
+        emit(settings.deviceId())
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = "",
+    )
+
+    fun send(body: String) {
+        viewModelScope.launch { repository.addLocal(body) }
+    }
+}
