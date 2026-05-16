@@ -32,10 +32,19 @@ class SettingsRepository(context: Context) {
         val SERVER_MODE = booleanPreferencesKey("server_mode")
         val DEVICE_ID = stringPreferencesKey("device_id")
         val DEVICE_NAME = stringPreferencesKey("device_name")
+        val SERVER_HOST = stringPreferencesKey("server_host")
     }
 
     val serverMode: Flow<Boolean> =
         dataStore.data.map { it[Keys.SERVER_MODE] ?: false }
+
+    /**
+     * Hub IP/hostname a leaf connects to (layer 2). Manual entry is the MVP:
+     * it is deterministic and avoids the flakiness of NSD/mDNS discovery on
+     * locked-down or multi-subnet Wi-Fi. Empty until the user enters one.
+     */
+    val serverHost: Flow<String> =
+        dataStore.data.map { it[Keys.SERVER_HOST] ?: "" }
 
     /**
      * Emits the persisted device name. On first run no name is stored yet, so
@@ -54,6 +63,14 @@ class SettingsRepository(context: Context) {
         if (trimmed.isEmpty()) return
         dataStore.edit { it[Keys.DEVICE_NAME] = trimmed }
     }
+
+    suspend fun setServerHost(host: String) {
+        dataStore.edit { it[Keys.SERVER_HOST] = host.trim() }
+    }
+
+    /** Current resolved hub host (empty string if unset). */
+    suspend fun currentServerHost(): String =
+        dataStore.data.first()[Keys.SERVER_HOST] ?: ""
 
     /**
      * Returns the stable device id, generating and persisting one on first

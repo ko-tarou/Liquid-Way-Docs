@@ -21,8 +21,18 @@ class MessageRepository(
     val messages: Flow<List<Message>> = dao.observeAll()
 
     /**
-     * Creates a message authored by this device, persists it as [LOCAL] and
-     * returns it. Blank bodies are rejected (returns null).
+     * The single outbound window. The networking layer ([MeshController])
+     * installs itself here; until then sends are a no-op (message stays
+     * LOCAL). Layer 3's outbox will wrap this same hook — the UI never learns
+     * about the transport.
+     */
+    @Volatile
+    var transportSender: (suspend (Message) -> Unit)? = null
+
+    /**
+     * Creates a message authored by this device, persists it as [LOCAL],
+     * hands it to the transport (if any) and returns it. Blank bodies are
+     * rejected (returns null).
      */
     suspend fun addLocal(body: String): Message? {
         val text = body.trim()
@@ -37,7 +47,23 @@ class MessageRepository(
             status = MessageStatus.LOCAL,
         )
         dao.insert(message)
+        transportSender?.invoke(message)
         return message
+    }
+
+    /**
+     * Persists a message received from a peer. Dedup is handled by the DAO
+     * (OnConflict.IGNORE on the UUID primary key).
+     *
+     * @return true if the row was newly inserted, false if it was a duplicate.
+     */
+    suspend fun acceptRemote(message: Message): Boolean {
+        return dao.insertReturning(message) != -1L
+    }
+
+    /** Transport-driven status transition (e.g. LOCAL -> SENT on handoff). */
+    suspend fun updateStatus(id: String, status: MessageStatus) {
+        dao.updateStatus(id, status)
     }
 
     companion object {

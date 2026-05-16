@@ -40,12 +40,20 @@ fun SettingsScreen(
     val serverMode by viewModel.serverMode.collectAsStateWithLifecycle()
     val deviceName by viewModel.deviceName.collectAsStateWithLifecycle()
     val deviceId by viewModel.deviceId.collectAsStateWithLifecycle()
+    val serverHost by viewModel.serverHost.collectAsStateWithLifecycle()
 
     // Local editable copy; seeded from the persisted name once it resolves.
     var nameDraft by remember { mutableStateOf("") }
     LaunchedEffect(deviceName) {
         if (deviceName.isNotEmpty() && nameDraft.isEmpty()) {
             nameDraft = deviceName
+        }
+    }
+
+    var hostDraft by remember { mutableStateOf("") }
+    LaunchedEffect(serverHost) {
+        if (serverHost.isNotEmpty() && hostDraft.isEmpty()) {
+            hostDraft = serverHost
         }
     }
 
@@ -90,7 +98,45 @@ fun SettingsScreen(
                 )
             }
 
+            Text(
+                text = if (serverMode) {
+                    "Current mode: Hub (server) · listening on port 8765"
+                } else {
+                    "Current mode: Client (leaf) · connects to the hub below"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+
             HorizontalDivider()
+
+            // Hub IP only matters for a leaf; hide it in server mode.
+            if (!serverMode) {
+                Text("Server IP", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "The hub device's LAN IP (e.g. 192.168.1.20). Manual entry; " +
+                        "find it in the hub's Wi-Fi settings.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = hostDraft,
+                    onValueChange = { hostDraft = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("Hub IP / hostname") },
+                    trailingIcon = {
+                        androidx.compose.material3.TextButton(
+                            onClick = { viewModel.setServerHost(hostDraft) },
+                            enabled = hostDraft.isNotBlank() && hostDraft != serverHost,
+                        ) {
+                            Text("Save")
+                        }
+                    },
+                )
+
+                HorizontalDivider()
+            }
 
             Text("Device name", style = MaterialTheme.typography.titleMedium)
             OutlinedTextField(
