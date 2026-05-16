@@ -31,7 +31,7 @@ ADR-0001 では BLE Mesh ライブラリを「レンジ・スループット不�
 
 - **帯域**: Wi-Fi Direct 認証デバイスは典型 Wi-Fi 速度（最大 250 Mbps クラス）を出せる。写真ペイロード（R3）に十分（出典: Android Developers / devopedia, 下記）。BLE Mesh は実効数 kbps〜80 kbps・アプリ実ペイロード 11〜15 byte/メッセージで、写真転送には原理的に不適（出典: Bluetooth Mesh 解説, 下記）。これで ADR-0001 の BLE Mesh 却下判断を**追認**する。
 - **GMS 非依存（R6）**: Wi-Fi Direct は AOSP のフレームワーク API（`WifiP2pManager`）であり Google Play Services を要求しない。Nearby Connections は `com.google.android.gms:play-services-nearby` 依存で、災害時に GMS が劣化／未更新の端末で動作保証が弱い（出典: Google for Developers, 下記）。
-- **GO = サーバー役の自然な対応**: Wi-Fi Direct グループは「1 GO + 複数 P2P クライアント」の星型で、GO が DHCP サーバとアドレス割当を持つ。LiqMesh の「安定電源端末が LFM サーバーに昇格」（議事録 §9.2）と構造が一致し、ADR-0003 のスコアで選ばれた端末を GO に固定する設計に落とせる。
+- **GO = サーバー役の自然な対応**: Wi-Fi Direct グループは「1 GO + 複数 P2P クライアント」の星型で、GO が DHCP サーバとアドレス割当を持つ。LiqMesh の「安定電源端末が LFM サーバーに昇格」（議事録 §9.2）と構造が一致し、ADR-0003 のスコアで選ばれた端末を GO に固定する設計に落とせる。GO の喪失時にアプリ層 Leader 再選出（既定 6s）と OS の GO 再形成（秒〜数十秒）の遅延差を埋める移譲手順は **ADR-0003「GO ↔ Leader の束ねとフェイルオーバー手順」**で定義する。
 - **マルチホップ（R2）**: Wi-Fi Direct 単体はグループ内星型までしか規定しない。**複数 GO グループをアプリ層のストア&フォワード中継でつなぐ**ことでマルチホップを実現する（GO 端末が隣接グループにレガシークライアントとして二重所属、またはメッセージを物理的に運ぶ端末経由のエピデミック転送）。これは ADR-0005 の優先度キューと同じメッセージ層で実装する。
 
 **フォールバック / デモ縮退**: 12 時間 MVP では ADR-0001 通り「Ryzen AI PC = Wi-Fi AP」の星型インフラに縮退し、Wi-Fi Direct のマルチグループ中継は本番 Vision のスコープに置く（議事録 §11）。
@@ -59,16 +59,20 @@ ADR-0001 では BLE Mesh ライブラリを「レンジ・スループット不�
 
 ### 負の帰結・受容するトレードオフ
 
+- **【最大の技術リスク】要件 R1「数十台規模」と Wi-Fi Direct 単一グループの実効同時クライアント数の乖離**: Wi-Fi Direct は規格上の上限を明示せず、実機の単一グループ同時接続は**一桁台（< 10 程度）に留まる報告が多い**（端末・OS 依存、要実機実測）。R1 の「数十台」を 1 グループでは満たせない前提であり、これは本 ADR で**最も重い技術リスク**として昇格扱いとする。緩和は「複数 GO グループをアプリ層ストア&フォワードで束ねるマルチホップ」だが、これ自体が Wi-Fi Direct 標準範囲外の自作要素であり、**マルチホップ中継の自作 PoC を最優先フォローアップ**に置く。
 - **マルチホップ中継はアプリ層で自作が必要**（Wi-Fi Direct 標準範囲外）。実装コスト増を受容し、ADR-0004/0005 のメッセージ層に統合する。
 - GO の選出・再選出は OS の P2P ネゴと自前ロジックの二層になり、競合制御が複雑（ADR-0003 で詳細化）。
 - 同時接続クライアント数の上限が端末依存で、標準が明示上限を規定しない（**要検証**: 主要実機での実測が必要）。
+- **【プロダクトリスク】12 時間 MVP の星型 AP 縮退で差別化点がデモに現れない**: LiqMesh の核（メッシュ／動的サーバー選出／split-brain 耐性）は星型 AP 縮退では動作として観客に見えず、前回 Gold（単機 SafeGuide）との差別化（議事録 §14）がデモ上消えるリスクがある。受容しつつ、見せ方の演出設計は将来の 01_vision_and_scope に送る。
 - 12 時間 MVP では星型 AP に縮退するため、フルメッシュ動作の検証は本番 Vision フェーズに先送り。
 
 ### フォローアップ
 
-- ADR-0003: GO 端末をどのスコアで選び、故障時にどう GO を切り替えるか。
+- ADR-0003: GO 端末をどのスコアで選び、故障時にどう GO を切り替えるか（GO ↔ Leader 移譲手順含む）。
 - ADR-0005: マルチグループ中継時の優先度キューとストア&フォワード方針。
+- **最優先フォローアップ**: 複数 GO グループをアプリ層で束ねるマルチホップ中継の自作 PoC（R1「数十台」の唯一の現実解。本 ADR の最大技術リスクの直接緩和）。
 - 要検証タスク: 主要 Android 実機（Pixel / Galaxy）での Wi-Fi Direct 同時クライアント数とマルチグループ二重所属の可否を実測。
+- Vision 専用の検証（VL 等 AI 機能の本番品質）はハッカソンの critical path から除外し、詳細集約は将来の 01_vision_and_scope に送る。
 
 ---
 
@@ -78,5 +82,7 @@ ADR-0001 では BLE Mesh ライブラリを「レンジ・スループット不�
 - Nearby Connections（GMS 依存・トポロジ・レンジ）: <https://developers.google.com/nearby/connections/overview> / <https://developers.google.com/nearby/connections/strategies>
 - Wi-Fi Aware（API 26+、断片化、`isAvailable()`）: <https://developer.android.com/develop/connectivity/wifi/wifi-aware> / <https://www.wi-fi.org/knowledge-center/faq/can-my-device-be-updated-to-support-wi-fi-aware>
 - BLE Mesh スループット／ペイロード制約: <https://argenox.com/blog/10-reasons-why-ble-mesh-has-struggled-to-gain-traction> / <https://www.beaconzone.co.uk/blog/the-limitations-of-bluetooth-mesh/>
+
+> Review: multi-review 2026-05-17 の指摘 #1–#5 を反映、#6–#12 を Risk/補足として反映。
 
 記録: Claude Code (Opus 4.7) / 2026-05-17
