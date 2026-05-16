@@ -35,6 +35,19 @@ interface MeshTransport {
      */
     suspend fun send(message: Message): Boolean
 
+    /**
+     * Best-effort send of a raw, already-framed wire line (terminated by '\n').
+     *
+     * Used by layer 3 to put non-[Message] frames (sync_req / sync_resp) on the
+     * same socket without the transport needing to know the protocol.
+     *
+     * Hub: fan-out to every connected client.
+     * Leaf: write to the server socket.
+     *
+     * @return true if the bytes reached at least one live socket.
+     */
+    suspend fun sendRaw(line: String): Boolean
+
     /** Tears down all sockets and coroutines. Idempotent. */
     suspend fun stop()
 }

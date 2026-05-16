@@ -27,7 +27,8 @@ import java.util.concurrent.atomic.AtomicLong
  * Responsibilities:
  *  - accept many client sockets, one accept-loop coroutine,
  *  - one reader coroutine per client,
- *  - on inbound: persist via [onInbound] then relay to *every other* client,
+ *  - on inbound msg: persist via [events] then relay to *every other* client,
+ *  - on inbound sync_req: replay backfill to *that one* client only,
  *  - on local [send]: fan out to *all* clients.
  *
  * Writes to a socket are serialised per-connection by synchronising on its
@@ -44,8 +45,7 @@ class MeshServer(
      * deterministic relay tests pass "127.0.0.1" to stay on the loopback.
      */
     private val bindAddress: String = "0.0.0.0",
-    /** Persist hook: returns true if the message was newly stored. */
-    private val onInbound: suspend (Message) -> Boolean,
+    private val events: MeshEvents,
 ) : MeshTransport {
 
     private companion object {
@@ -121,19 +121,33 @@ class MeshServer(
         Log.i(TAG, "Client ${conn.id} connected (${clients.size} total)")
 
         scope.launch {
+            events.onLinkEstablished(this@MeshServer)
             try {
                 val reader = BufferedReader(
                     InputStreamReader(socket.getInputStream(), Charsets.UTF_8),
                 )
                 while (isActive) {
                     val line = reader.readLine() ?: break
-                    val msg = MessageWire.decode(line) ?: continue
-                    val isNew = onInbound(msg)
-                    // Relay to every *other* client so the star behaves as a bus.
-                    // Dedup is the leaves' job (DAO OnConflict.IGNORE); relaying
-                    // unconditionally keeps the hub stateless and simple.
-                    relay(msg, exclude = conn.id)
-                    if (!isNew) Log.d(TAG, "Duplicate ${msg.id} re-relayed")
+                    when (val f = MessageWire.decodeFrame(line)) {
+                        is MessageWire.Frame.Msg -> {
+                            val isNew = events.onMessage(f.message)
+                            // Relay to every *other* client so the star behaves
+                            // as a bus. Dedup is the leaves' job (DAO
+                            // OnConflict.IGNORE); relaying unconditionally keeps
+                            // the hub stateless and simple.
+                            relay(f.message, exclude = conn.id)
+                            if (!isNew) Log.d(TAG, "Duplicate ${f.message.id} re-relayed")
+                        }
+                        is MessageWire.Frame.SyncReq -> {
+                            // Backfill ONLY the requesting client. Each
+                            // sync_resp is written to this conn's socket;
+                            // dedup on the leaf collapses any overlap.
+                            events.onSyncRequest(f.since) { line2 ->
+                                writeTo(conn, line2)
+                            }
+                        }
+                        MessageWire.Frame.Unknown -> Unit // skip; keep the link
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Client ${conn.id} read error: ${e.message}")
@@ -178,8 +192,10 @@ class MeshServer(
     }
 
     /** Local fan-out: a message authored on the hub goes to all leaves. */
-    override suspend fun send(message: Message): Boolean {
-        val line = MessageWire.encode(message)
+    override suspend fun send(message: Message): Boolean =
+        sendRaw(MessageWire.encode(message))
+
+    override suspend fun sendRaw(line: String): Boolean {
         var delivered = false
         for ((_, conn) in clients) {
             if (writeTo(conn, line)) delivered = true
