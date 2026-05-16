@@ -39,9 +39,14 @@ results.md の結論を引用すると「素の transformers（量子化なし�
 
 選定方針: **品質確認は transformers（experiment 系）、本番サーバー実行は llama.cpp（直・最速）、開発速度重視は LEAP**。三者は競合でなく役割分担。
 
----
+### 推論並行度とスループット見積り
 
-## Alternatives Considered
+LiqMesh のサーバーは 1 台で**複数クライアントの推論要求を捌く**（議事録 §6「LFM2-1.2B で同時 3〜5 人、10 人規模は非同期構成」）。本番 Vision の昇格スマホは Ryzen AI PC より弱いため、並行モデルを明示する。
+
+- **単一ワーカ + キュー直列処理を基本**とする。スマホ上の llama.cpp 推論は VRAM/RAM とサーマル（ADR-0003 サーマル項）の制約が厳しく、複数推論の並列実行はメモリ二重化と発熱で破綻しやすいため、**要求は ADR-0005 の優先度キュー順に 1 件ずつ直列処理**するのを既定とする（CRITICAL から先に推論される）。
+- スループット見積り（**実数は experiment 002 で実測**、ここは推測オーダー）: experiment 001 実測の素 transformers 7〜8 tok/s に対し llama.cpp 量子化で 10〜20 tok/s 想定。1 応答 ≒ 数十〜百数十トークンとすると、直列で**毎分数〜十数要求オーダー**が上限の目安。これを超える同時要求は ADR-0005 のキューで滞留・エイジングし、超過分は #2 のシェディング規則に従う。
+- バックプレッシャ: 推論キュー長は ADR-0003 のスコア式 `L_i`（負荷ペナルティ）に直結し、過負荷時は委譲トリガ（ADR-0003 「過負荷」行）を引く。**並行度を上げて捌くのではなく、Leader を分散/委譲して負荷を逃がす**設計。
+- 実数（同時要求数の実上限、量子化モデル別の tok/s、直列 vs 限定並列の最適点）は **experiment 002 で実測**して確定する。
 
 | 案 | 長所 | 短所 | Android 制約 | 却下／位置づけ理由 |
 |---|---|---|---|---|
@@ -69,9 +74,10 @@ results.md の結論を引用すると「素の transformers（量子化なし�
 
 ### フォローアップ
 
-- experiment 002: LFM2.5-350M / 1.2B-JP / VL を GGUF 量子化し、llama.cpp で CPU / Android 実機スループットを実測（experiment 001 の Conclusion が予告した比較）。
+- experiment 002: LFM2.5-350M / 1.2B-JP / VL を GGUF 量子化し、llama.cpp で CPU / Android 実機スループットと**同時要求の並行度／キュー挙動**を実測（experiment 001 の Conclusion が予告した比較 + 本 ADR の並行度節）。
 - ADR-0005: 確定したサーバー実機スループットでキュー上限を再調整。
-- 要検証: LFM2.5 特定モデル × 提供 Android 端末での llama.cpp 実測 tok/s、VL の GGUF 量子化品質劣化、LEAP の VL 対応詳細。
+- 要検証: LFM2.5 特定モデル × 提供 Android 端末での llama.cpp 実測 tok/s、VL の GGUF 量子化品質劣化、LEAP の VL 対応詳細、直列 vs 限定並列の最適点。
+- Vision 専用の検証（特に VL 機能 6.1 の本番品質）はハッカソンの critical path から除外し、詳細集約は将来の 01_vision_and_scope に送る（MVP は VL を絞った Tier で扱う）。
 
 ---
 
@@ -81,5 +87,7 @@ results.md の結論を引用すると「素の transformers（量子化なし�
 - LEAP SDK Android production-ready: <https://leap.liquid.ai/> / <https://docs.liquid.ai/deployment/on-device/android/android-quick-start-guide>
 - llama.cpp Android 性能（1–3B Q4 で 10–20 tok/s）: <https://github.com/ggml-org/llama.cpp/discussions/14356> / <https://github.com/ggml-org/llama.cpp/blob/master/docs/android.md>
 - LFM2-VL GGUF + llama.cpp 公式対応: <https://docs.liquid.ai/deployment/on-device/llama-cpp> / <https://www.liquid.ai/blog/introducing-lfm2-5-the-next-generation-of-on-device-ai>
+
+> Review: multi-review 2026-05-17 の指摘 #1–#5 を反映、#6–#12 を Risk/補足として反映。
 
 記録: Claude Code (Opus 4.7) / 2026-05-17
