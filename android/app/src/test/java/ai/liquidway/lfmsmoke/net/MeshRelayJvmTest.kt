@@ -1,14 +1,25 @@
 package ai.liquidway.lfmsmoke.net
 
+import ai.liquidway.lfmsmoke.ai.FakeSummarizationEngine
+import ai.liquidway.lfmsmoke.ai.SummarizationEngine
+import ai.liquidway.lfmsmoke.data.AI_SENDER_ID
 import ai.liquidway.lfmsmoke.data.Message
 import ai.liquidway.lfmsmoke.data.MessageStatus
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Deterministic, emulator-independent proof of the LiqMesh star relay AND the
@@ -53,8 +64,27 @@ class MeshRelayJvmTest {
      *  - monotonic status (LOCAL < SENT < SYNCED; never demote),
      *  - the controller's backfill answer + leaf sync_req/outbox-on-connect.
      */
-    private class FakePeer(val name: String) : MeshEvents {
+    /**
+     * A test stand-in mirroring [ai.liquidway.lfmsmoke.net.MeshController]
+     * faithfully, including the layer-4 summary policy:
+     *  - server-only generation (a leaf ignores summary_req),
+     *  - generation dispatched OFF the reader (own coroutine) so plain chat
+     *    keeps relaying,
+     *  - single-flight dedup (a second summary_req while one runs is coalesced),
+     *  - the AI summary is stored locally then relayed as a normal msg.
+     */
+    private class FakePeer(
+        val name: String,
+        private val serverMode: Boolean = false,
+        private val engine: SummarizationEngine? = null,
+        // The hub relays the produced summary through this transport.
+        var relayTransport: MeshTransport? = null,
+    ) : MeshEvents {
         val store = ConcurrentHashMap<String, Message>()
+        private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        private val summaryDispatcher = Dispatchers.IO.limitedParallelism(1)
+        private val summaryInFlight = AtomicBoolean(false)
+        val summaryRunning = AtomicBoolean(false)
 
         fun put(m: Message): Boolean {
             val prev = store.putIfAbsent(m.id, m)
@@ -88,6 +118,35 @@ class MeshRelayJvmTest {
                     .filter { it.status == MessageStatus.LOCAL }
                     .sortedBy { it.createdAt }
                     .forEach { if (transport.send(it)) markSent(it.id) }
+            }
+        }
+
+        // ---- Layer 4 (mirrors MeshController.onSummaryRequest) -----------
+        override suspend fun onSummaryRequest(since: Long) {
+            if (!serverMode) return // leaf never runs the model
+            if (!summaryInFlight.compareAndSet(false, true)) return // coalesce
+            scope.launch(summaryDispatcher) {
+                summaryRunning.set(true)
+                try {
+                    val eng = engine ?: return@launch
+                    // Recent non-AI window, oldest-first, count-capped.
+                    val window = store.values
+                        .filter { it.senderId != AI_SENDER_ID }
+                        .sortedByDescending { it.createdAt }
+                        .take(SummarizationEngine.MAX_SUMMARY_MESSAGES)
+                        .asReversed()
+                    val text = eng.summarize(window)
+                    val summary = MessageWire.aiSummaryMessage(
+                        id = UUID.randomUUID().toString(),
+                        body = text,
+                        createdAt = System.currentTimeMillis(),
+                    )
+                    put(summary)
+                    relayTransport?.send(summary)
+                } finally {
+                    summaryRunning.set(false)
+                    summaryInFlight.set(false)
+                }
             }
         }
     }
@@ -253,5 +312,161 @@ class MeshRelayJvmTest {
         } finally {
             client?.stop(); server.stop()
         }
+    }
+
+    // ---- (d) Layer 4: summary_req -> hub LFM -> ai_summary to all --------
+
+    @Test
+    fun summaryRequestRunsOnHubAndRelaysAiSummaryToAllClients() = runBlocking {
+        val fake = FakeSummarizationEngine()
+        val hub = FakePeer("hub", serverMode = true, engine = fake)
+        val bPeer = FakePeer("B")
+        val server = startHub(hub)
+        hub.relayTransport = server
+        var clientA: MeshClient? = null
+        var clientB: MeshClient? = null
+        try {
+            val port = server.boundPort
+            clientA = MeshClient("127.0.0.1", port, FakePeer("A"))
+            clientB = MeshClient("127.0.0.1", port, bPeer)
+            clientA.start(); clientB.start()
+            await("2 peers") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 2
+            }
+            // Seed chat history on the hub (as if relayed earlier).
+            hub.put(msg("c-1", "water needed at shelter", "A", 1_000, MessageStatus.SENT))
+            hub.put(msg("c-2", "two injured here", "B", 2_000, MessageStatus.SENT))
+
+            // Client A taps "状況まとめ": frames a summary_req to the hub.
+            assertTrue(clientA.sendRaw(MessageWire.encodeSummaryReq()))
+
+            // Hub generated one AI summary and relayed it to every client.
+            await("hub stored ai_summary") {
+                hub.store.values.any { it.senderId == AI_SENDER_ID }
+            }
+            await("client B got ai_summary") {
+                bPeer.store.values.any { it.senderId == AI_SENDER_ID }
+            }
+            val aiMsg = bPeer.store.values.first { it.senderId == AI_SENDER_ID }
+            assertTrue("summary digests chat", aiMsg.body.contains("water needed"))
+            assertEquals(1, fake.callCount.get())
+            // The window excluded any AI message (none yet) and was count-capped.
+            assertEquals(2, fake.lastWindowSize)
+        } finally {
+            clientA?.stop(); clientB?.stop(); server.stop()
+        }
+    }
+
+    @Test
+    fun leafIgnoresSummaryRequestAndOnlyHubGenerates() = runBlocking {
+        val fake = FakeSummarizationEngine()
+        // serverMode=false: this peer must NOT run the model even if asked.
+        val leaf = FakePeer("leaf", serverMode = false, engine = fake)
+        leaf.onSummaryRequest(0L)
+        Thread.sleep(150)
+        assertEquals(0, fake.callCount.get())
+        assertFalse(leaf.store.values.any { it.senderId == AI_SENDER_ID })
+    }
+
+    @Test
+    fun duplicateSummaryRequestsAreCoalescedWhileOneIsInFlight() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val fake = FakeSummarizationEngine(gate)
+        val hub = FakePeer("hub", serverMode = true, engine = fake)
+        val server = startHub(hub)
+        hub.relayTransport = server
+        var client: MeshClient? = null
+        try {
+            client = MeshClient("127.0.0.1", server.boundPort, FakePeer("A"))
+            client.start()
+            await("connected") { client!!.state.value is MeshState.Connected }
+            hub.put(msg("k-1", "status ok", "A", 1_000, MessageStatus.SENT))
+
+            // Fire 3 summary_req in quick succession; gen is parked on `gate`.
+            repeat(3) { client.sendRaw(MessageWire.encodeSummaryReq()) }
+            await("one generation started") { fake.callCount.get() == 1 }
+            // While parked, more requests must NOT start a second generation.
+            client.sendRaw(MessageWire.encodeSummaryReq())
+            Thread.sleep(200)
+            assertEquals("single-flight: only one gen", 1, fake.callCount.get())
+
+            // Release: the in-flight one completes and produces exactly one msg.
+            gate.complete(Unit)
+            await("ai_summary stored") {
+                hub.store.values.count { it.senderId == AI_SENDER_ID } == 1
+            }
+            assertEquals(1, hub.store.values.count { it.senderId == AI_SENDER_ID })
+        } finally {
+            client?.stop(); server.stop()
+        }
+    }
+
+    @Test
+    fun plainChatKeepsRelayingWhileASummaryIsBeingGenerated() = runBlocking {
+        // Park the (slow) summary on a gate, then prove plain messages still
+        // traverse the hub and reach the other client meanwhile = "chat first".
+        val gate = CompletableDeferred<Unit>()
+        val fake = FakeSummarizationEngine(gate)
+        val hub = FakePeer("hub", serverMode = true, engine = fake)
+        val bPeer = FakePeer("B")
+        val server = startHub(hub)
+        hub.relayTransport = server
+        var clientA: MeshClient? = null
+        var clientB: MeshClient? = null
+        try {
+            val port = server.boundPort
+            clientA = MeshClient("127.0.0.1", port, FakePeer("A"))
+            clientB = MeshClient("127.0.0.1", port, bPeer)
+            clientA.start(); clientB.start()
+            await("2 peers") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 2
+            }
+            hub.put(msg("p-0", "seed", "A", 500, MessageStatus.SENT))
+
+            // Kick off a summary that will block inside the engine.
+            assertTrue(clientA.sendRaw(MessageWire.encodeSummaryReq()))
+            await("generation parked") {
+                fake.callCount.get() == 1 && hub.summaryRunning.get()
+            }
+
+            // With a summary mid-flight, send plain chat A -> hub -> B.
+            assertTrue(clientA.send(msg("p-1", "still chatting", "A", 1_000)))
+            await("plain msg relayed to B during summary") {
+                bPeer.store.containsKey("p-1")
+            }
+            assertEquals("still chatting", bPeer.store["p-1"]!!.body)
+            // Summary still not done (proves chat did not wait on it).
+            assertFalse(hub.store.values.any { it.senderId == AI_SENDER_ID })
+
+            // Now let the summary finish; it lands without disturbing chat.
+            gate.complete(Unit)
+            await("ai_summary eventually delivered") {
+                bPeer.store.values.any { it.senderId == AI_SENDER_ID }
+            }
+        } finally {
+            clientA?.stop(); clientB?.stop(); server.stop()
+        }
+    }
+
+    @Test
+    fun aiSummaryFrameRoundTripsAsAnOrdinaryMessage() {
+        val m = MessageWire.aiSummaryMessage("s1", "the situation summary", 42L)
+        val decoded = MessageWire.decode(MessageWire.encode(m))
+        assertNotNull(decoded)
+        assertEquals(AI_SENDER_ID, decoded!!.senderId)
+        assertEquals("the situation summary", decoded.body)
+        assertEquals(MessageStatus.SENT, decoded.status)
+        // summary_req decodes to its own frame, never a Msg.
+        assertNull(MessageWire.decode(MessageWire.encodeSummaryReq(9L)))
+        assertTrue(
+            MessageWire.decodeFrame(MessageWire.encodeSummaryReq(9L))
+                is MessageWire.Frame.SummaryReq,
+        )
+        // An old peer that lacks summary_req support skips it (Unknown-safe):
+        // decodeFrame must still not throw on the new type.
+        assertTrue(
+            MessageWire.decodeFrame(MessageWire.encodeSummaryReq())
+                !is MessageWire.Frame.Unknown,
+        )
     }
 }
