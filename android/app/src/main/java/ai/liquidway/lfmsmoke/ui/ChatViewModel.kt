@@ -34,6 +34,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             initialValue = emptyList(),
         )
 
+    /** Number of locally-authored messages still queued (outbox), for the UI. */
+    val pendingCount: StateFlow<Int> = repository.pendingCount
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = 0,
+        )
+
     /** This device's stable id, used by the UI to align bubbles (self/other). */
     val deviceId: StateFlow<String> = kotlinx.coroutines.flow.flow {
         emit(settings.deviceId())
