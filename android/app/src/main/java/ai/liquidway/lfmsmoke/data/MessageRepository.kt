@@ -20,6 +20,9 @@ class MessageRepository(
 
     val messages: Flow<List<Message>> = dao.observeAll()
 
+    /** Live count of un-sent (LOCAL) messages, surfaced subtly in the UI. */
+    val pendingCount: Flow<Int> = dao.observePendingCount()
+
     /**
      * The single outbound window. The networking layer ([MeshController])
      * installs itself here; until then sends are a no-op (message stays
@@ -65,6 +68,28 @@ class MessageRepository(
     suspend fun updateStatus(id: String, status: MessageStatus) {
         dao.updateStatus(id, status)
     }
+
+    /**
+     * Snapshot of the send outbox: locally-authored messages still LOCAL
+     * (never handed to a socket), oldest first. Layer 3 drains this on
+     * (re)connect.
+     */
+    suspend fun outbox(): List<Message> = dao.pendingOutbox()
+
+    /**
+     * Messages this device holds that were created after [since], capped at
+     * [limit] and returned oldest-first so the peer can insert them in chat
+     * order. Used to answer a backfill (sync_req) from a peer.
+     */
+    suspend fun backfillSince(since: Long, limit: Int): List<Message> =
+        dao.recentSince(since, limit).asReversed()
+
+    /**
+     * Backfill watermark: highest createdAt among messages received from a
+     * peer (status != LOCAL), or 0 when none. Excludes this device's own
+     * offline-queued LOCAL rows so they cannot mask peer messages still needed.
+     */
+    suspend fun latestCreatedAt(): Long = dao.maxSyncedCreatedAt() ?: 0L
 
     companion object {
         @Volatile

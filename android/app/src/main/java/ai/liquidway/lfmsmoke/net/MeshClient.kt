@@ -24,17 +24,18 @@ import java.net.Socket
  * A leaf node (serverMode = OFF) that maintains a single socket to the hub.
  *
  * A supervised loop keeps reconnecting with a capped backoff so a hub restart
- * or transient Wi-Fi blip self-heals. Inbound lines are persisted via
- * [onInbound]; there is no relay (the hub owns fan-out).
+ * or transient Wi-Fi blip self-heals. Inbound lines are decoded to frames and
+ * dispatched to [events]; there is no relay (the hub owns fan-out).
  *
- * NOTE: messages that fail to send while disconnected are intentionally left
- * as LOCAL — replaying them is layer 3 (outbox). [send] never lies about
- * delivery.
+ * Layer 3: each time the socket comes up, [MeshEvents.onLinkEstablished] is
+ * invoked so the controller can flush the outbox and request backfill. Messages
+ * that fail to send while disconnected stay LOCAL — [send] never lies about
+ * delivery; the outbox flush replays them on the next link.
  */
 class MeshClient(
     private val host: String,
     private val port: Int = MessageWire.DEFAULT_PORT,
-    private val onInbound: suspend (Message) -> Boolean,
+    private val events: MeshEvents,
 ) : MeshTransport {
 
     private companion object {
@@ -102,13 +103,25 @@ class MeshClient(
             _state.value = MeshState.Connected(host, port)
             Log.i(TAG, "Connected to $host:$port")
 
+            // Layer 3: drain the outbox and ask the hub for anything we missed
+            // while offline. Done off the reader path so a slow flush cannot
+            // delay reading inbound backfill.
+            scope.launch { events.onLinkEstablished(this@MeshClient) }
+
             try {
                 val reader = BufferedReader(
                     InputStreamReader(s.getInputStream(), Charsets.UTF_8),
                 )
                 while (scope.isActive) {
                     val line = reader.readLine() ?: break
-                    MessageWire.decode(line)?.let { onInbound(it) }
+                    when (val f = MessageWire.decodeFrame(line)) {
+                        is MessageWire.Frame.Msg -> events.onMessage(f.message)
+                        is MessageWire.Frame.SyncReq ->
+                            // A leaf never serves backfill (only the hub does);
+                            // ignore defensively.
+                            Log.d(TAG, "Ignoring sync_req on leaf")
+                        MessageWire.Frame.Unknown -> Unit // skip; keep the link
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Read loop ended: ${e.message}")
@@ -124,10 +137,13 @@ class MeshClient(
         }
     }
 
-    override suspend fun send(message: Message): Boolean {
+    override suspend fun send(message: Message): Boolean =
+        sendRaw(MessageWire.encode(message))
+
+    override suspend fun sendRaw(line: String): Boolean {
         val stream = out ?: return false
         return try {
-            val bytes = MessageWire.encode(message).toByteArray(Charsets.UTF_8)
+            val bytes = line.toByteArray(Charsets.UTF_8)
             synchronized(writeLock) {
                 stream.write(bytes)
                 stream.flush()

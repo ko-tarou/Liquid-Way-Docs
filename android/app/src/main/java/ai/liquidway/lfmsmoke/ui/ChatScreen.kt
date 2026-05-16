@@ -53,6 +53,7 @@ fun ChatScreen(
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val deviceId by viewModel.deviceId.collectAsStateWithLifecycle()
     val meshState by viewModel.meshState.collectAsStateWithLifecycle()
+    val pendingCount by viewModel.pendingCount.collectAsStateWithLifecycle()
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
@@ -77,7 +78,7 @@ fun ChatScreen(
         },
     ) { inner ->
         Column(modifier = Modifier.fillMaxSize().padding(inner)) {
-            MeshStatusBar(meshState)
+            MeshStatusBar(meshState, pendingCount)
 
             if (messages.isEmpty()) {
                 Box(
@@ -141,7 +142,7 @@ fun ChatScreen(
  * link (hub with peers / connected leaf), amber = transient, neutral = idle.
  */
 @Composable
-private fun MeshStatusBar(state: MeshState) {
+private fun MeshStatusBar(state: MeshState, pendingCount: Int) {
     val (label, container, onContainer) = when (state) {
         is MeshState.Idle -> Triple(
             "Mesh idle",
@@ -179,8 +180,11 @@ private fun MeshStatusBar(state: MeshState) {
             .background(container)
             .padding(horizontal = 12.dp, vertical = 6.dp),
     ) {
+        // Append a quiet outbox hint only while messages are actually queued,
+        // so a healthy link shows nothing extra.
+        val text = if (pendingCount > 0) "$label · $pendingCount queued" else label
         Text(
-            text = label,
+            text = text,
             style = MaterialTheme.typography.labelMedium,
             color = onContainer,
         )
