@@ -1,0 +1,13 @@
+# Local model cache (HF_HOME) — never commit weights
+models/*
+!models/.gitkeep
+
+# Heavy raw run logs / measurement dumps
+runs/*
+!runs/.gitkeep
+
+# Python venv & caches
+.venv/
+venv/
+__pycache__/
+*.pyc
