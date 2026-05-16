@@ -1,5 +1,6 @@
 package ai.liquidway.lfmsmoke.ui
 
+import ai.liquidway.lfmsmoke.data.AI_SENDER_ID
 import ai.liquidway.lfmsmoke.data.Message
 import ai.liquidway.lfmsmoke.net.MeshState
 import androidx.compose.foundation.background
@@ -17,13 +18,17 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -54,8 +59,12 @@ fun ChatScreen(
     val deviceId by viewModel.deviceId.collectAsStateWithLifecycle()
     val meshState by viewModel.meshState.collectAsStateWithLifecycle()
     val pendingCount by viewModel.pendingCount.collectAsStateWithLifecycle()
+    val summaryRunning by viewModel.summaryRunning.collectAsStateWithLifecycle()
+    val summaryRequested by viewModel.summaryRequested.collectAsStateWithLifecycle()
+    val summaryError by viewModel.summaryError.collectAsStateWithLifecycle()
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val snackbarHost = remember { SnackbarHostState() }
 
     // Keep the newest message in view as the list grows.
     LaunchedEffect(messages.size) {
@@ -64,12 +73,47 @@ fun ChatScreen(
         }
     }
 
+    // Release the leaf-side button latch once the relayed AI summary lands.
+    LaunchedEffect(messages.lastOrNull()?.id) {
+        viewModel.clearSummaryLatchOnResult(
+            latestIsAi = messages.lastOrNull()?.senderId == AI_SENDER_ID,
+        )
+    }
+
+    LaunchedEffect(summaryError) {
+        summaryError?.let {
+            snackbarHost.showSnackbar(it)
+            viewModel.dismissSummaryError()
+        }
+    }
+
+    // The button shows progress while either the local request is latched or
+    // the hub reports an active generation.
+    val summaryBusy = summaryRunning || summaryRequested
+
     Scaffold(
         modifier = modifier,
+        snackbarHost = { SnackbarHost(snackbarHost) },
         topBar = {
             TopAppBar(
                 title = { Text("LiqMesh") },
                 actions = {
+                    IconButton(
+                        onClick = { viewModel.requestSummary() },
+                        enabled = !summaryBusy,
+                    ) {
+                        if (summaryBusy) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.padding(4.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        } else {
+                            Icon(
+                                Icons.Filled.Info,
+                                contentDescription = "状況まとめ",
+                            )
+                        }
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
                     }
@@ -99,10 +143,14 @@ fun ChatScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     items(messages, key = { it.id }) { message ->
-                        MessageBubble(
-                            message = message,
-                            isMine = message.senderId == deviceId,
-                        )
+                        if (message.senderId == AI_SENDER_ID) {
+                            AiSummaryBubble(message)
+                        } else {
+                            MessageBubble(
+                                message = message,
+                                isMine = message.senderId == deviceId,
+                            )
+                        }
                     }
                 }
             }
@@ -188,6 +236,54 @@ private fun MeshStatusBar(state: MeshState, pendingCount: Int) {
             style = MaterialTheme.typography.labelMedium,
             color = onContainer,
         )
+    }
+}
+
+/**
+ * Centered, full-width card for AI-authored summaries. Deliberately distinct
+ * from the left/right chat bubbles (centred, tertiary colour, sparkle + label)
+ * so a summary reads as a system insight rather than a participant's message.
+ */
+@Composable
+private fun AiSummaryBubble(message: Message) {
+    val timeFormat = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        Surface(
+            color = MaterialTheme.colorScheme.tertiaryContainer,
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Filled.Info,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                        modifier = Modifier.padding(end = 6.dp),
+                    )
+                    Text(
+                        text = message.senderName,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                }
+                Text(
+                    text = message.body,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Text(
+                    text = timeFormat.format(Date(message.createdAt)),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                    modifier = Modifier.padding(top = 4.dp).align(Alignment.End),
+                )
+            }
+        }
     }
 }
 
