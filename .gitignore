@@ -28,3 +28,16 @@ venv/
 dist/
 build/
 *.log
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/captures/
+*.iml
+*.apk
+# LEAP model cache (downloaded at runtime)
+android/**/models/
+*.gguf
+*.bundle
