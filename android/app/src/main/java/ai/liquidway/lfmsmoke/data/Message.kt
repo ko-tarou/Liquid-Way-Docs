@@ -26,6 +26,16 @@ enum class MessageStatus {
  * (rather than an auto-increment) lets the future sync layer deduplicate
  * messages received from multiple peers (insert is OnConflict.IGNORE).
  */
+/**
+ * Reserved identity for AI-authored (layer-4 summary) messages. Defined in the
+ * data package so both the repository/DAO and the wire layer can share one
+ * source of truth without a data -> net dependency cycle.
+ */
+const val AI_SENDER_ID = "ai"
+
+/** Display name carried on AI summary messages. */
+const val AI_SENDER_NAME = "AI まとめ"
+
 @Entity(tableName = "messages")
 data class Message(
     @PrimaryKey
