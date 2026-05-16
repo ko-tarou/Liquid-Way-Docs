@@ -33,4 +33,18 @@ interface MeshEvents {
      * answers backfill reactively via [onSyncRequest].
      */
     suspend fun onLinkEstablished(transport: MeshTransport)
+
+    /**
+     * Layer 4: a device asked for a situational summary of recent chat.
+     *
+     * Only the hub (serverMode=ON) acts on this — it runs the on-device LFM
+     * over the recent window and broadcasts the result as an ordinary AI
+     * message. A leaf receiving this (it never should, the hub does fan-out
+     * for chat not for summary_req) ignores it. The implementation must NOT
+     * block the caller (transport reader): heavyweight generation is dispatched
+     * onto a separate low-priority coroutine so plain chat keeps relaying.
+     *
+     * @param since advisory high-water mark (0 = "recent window, hub decides").
+     */
+    suspend fun onSummaryRequest(since: Long)
 }

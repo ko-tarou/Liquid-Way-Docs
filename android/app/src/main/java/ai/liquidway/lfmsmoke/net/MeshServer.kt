@@ -146,6 +146,13 @@ class MeshServer(
                                 writeTo(conn, line2)
                             }
                         }
+                        is MessageWire.Frame.SummaryReq -> {
+                            // Layer 4: the hub owns the model. onSummaryRequest
+                            // returns fast (it dispatches generation onto its
+                            // own coroutine) so this read loop keeps relaying
+                            // plain chat while a summary is produced.
+                            events.onSummaryRequest(f.since)
+                        }
                         MessageWire.Frame.Unknown -> Unit // skip; keep the link
                     }
                 }

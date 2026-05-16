@@ -1,5 +1,7 @@
 package ai.liquidway.lfmsmoke.net
 
+import ai.liquidway.lfmsmoke.data.AI_SENDER_ID as DATA_AI_SENDER_ID
+import ai.liquidway.lfmsmoke.data.AI_SENDER_NAME as DATA_AI_SENDER_NAME
 import ai.liquidway.lfmsmoke.data.Message
 import ai.liquidway.lfmsmoke.data.MessageStatus
 import org.json.JSONObject
@@ -14,12 +16,20 @@ import org.json.JSONObject
  * Layer 3 introduces a small envelope so the same socket carries three kinds of
  * frame:
  *
- *  - [TYPE_MSG]       : a chat [Message] (the layer-2 payload).
- *  - [TYPE_SYNC_REQ]  : a backfill request — "send me everything created after
- *                       `since` (epoch ms)". Sent by a leaf right after it
- *                       connects so it catches up on messages it missed while
- *                       offline.
- *  - [TYPE_SYNC_RESP] : a single message replayed in answer to a sync request.
+ *  - [TYPE_MSG]         : a chat [Message] (the layer-2 payload).
+ *  - [TYPE_SYNC_REQ]    : a backfill request — "send me everything created
+ *                         after `since` (epoch ms)". Sent by a leaf right after
+ *                         it connects so it catches up on messages it missed
+ *                         while offline.
+ *  - [TYPE_SYNC_RESP]   : a single message replayed in answer to a sync request.
+ *  - [TYPE_SUMMARY_REQ] : layer-4 — "run the on-device LFM over recent chat and
+ *                         broadcast a situational summary". Any device can emit
+ *                         it; only the hub (serverMode=ON) acts on it.
+ *
+ * Layer 4 deliberately does NOT add a new frame for the *result*: an AI summary
+ * is materialised as an ordinary [TYPE_MSG] whose `senderId` is [AI_SENDER_ID],
+ * so the existing relay, DAO dedup and backfill carry it for free and old peers
+ * render it as a normal (visually-distinguished) bubble.
  *
  * BACKWARD COMPATIBILITY: a frame *without* a `type` field is interpreted as
  * [TYPE_MSG]. Layer-2 peers emit exactly that shape, so an old peer and a new
@@ -40,6 +50,18 @@ object MessageWire {
     const val TYPE_MSG = "msg"
     const val TYPE_SYNC_REQ = "sync_req"
     const val TYPE_SYNC_RESP = "sync_resp"
+    const val TYPE_SUMMARY_REQ = "summary_req"
+
+    /**
+     * Reserved sender id for AI-authored summary messages (re-exported from the
+     * data package so wire-layer callers need not reach across packages). A
+     * message with this sender renders as a system/AI bubble and is excluded
+     * from the window fed back into the model.
+     */
+    const val AI_SENDER_ID = DATA_AI_SENDER_ID
+
+    /** Display name carried on AI summary messages. */
+    const val AI_SENDER_NAME = DATA_AI_SENDER_NAME
 
     /** A decoded inbound frame. */
     sealed interface Frame {
@@ -49,9 +71,28 @@ object MessageWire {
         /** A backfill request: replay everything created after [since] (epoch ms). */
         data class SyncReq(val since: Long) : Frame
 
+        /**
+         * Layer-4 request to summarise recent chat. [since] is advisory only
+         * (kept 0 today); the hub caps the window by count itself. Modelled as
+         * a frame, not a [Message], because it triggers work rather than
+         * carrying content.
+         */
+        data class SummaryReq(val since: Long) : Frame
+
         /** Malformed or unrecognised line; the reader skips it without dropping the link. */
         data object Unknown : Frame
     }
+
+    /** Builds an AI-authored summary [Message] (rides the normal msg path). */
+    fun aiSummaryMessage(id: String, body: String, createdAt: Long): Message =
+        Message(
+            id = id,
+            senderId = AI_SENDER_ID,
+            senderName = AI_SENDER_NAME,
+            body = body,
+            createdAt = createdAt,
+            status = MessageStatus.SENT,
+        )
 
     /** Serialises a chat message as a [TYPE_MSG] frame. */
     fun encode(message: Message): String = encodeMessage(message, TYPE_MSG)
@@ -62,6 +103,10 @@ object MessageWire {
     /** Serialises a backfill request carrying the requester's high-water mark. */
     fun encodeSyncReq(since: Long): String =
         JSONObject().put("type", TYPE_SYNC_REQ).put("since", since).toString() + "\n"
+
+    /** Serialises a layer-4 "summarise recent chat" request. */
+    fun encodeSummaryReq(since: Long = 0L): String =
+        JSONObject().put("type", TYPE_SUMMARY_REQ).put("since", since).toString() + "\n"
 
     private fun encodeMessage(message: Message, type: String): String {
         val json = JSONObject()
@@ -99,6 +144,7 @@ object MessageWire {
                     ),
                 )
                 TYPE_SYNC_REQ -> Frame.SyncReq(json.getLong("since"))
+                TYPE_SUMMARY_REQ -> Frame.SummaryReq(json.optLong("since", 0L))
                 else -> Frame.Unknown
             }
         } catch (_: Exception) {
