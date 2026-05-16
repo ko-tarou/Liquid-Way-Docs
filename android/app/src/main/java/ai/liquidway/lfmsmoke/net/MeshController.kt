@@ -1,5 +1,6 @@
 package ai.liquidway.lfmsmoke.net
 
+import ai.liquidway.lfmsmoke.ai.SummarizationEngine
 import ai.liquidway.lfmsmoke.data.Message
 import ai.liquidway.lfmsmoke.data.MessageRepository
 import ai.liquidway.lfmsmoke.data.MessageStatus
@@ -16,6 +17,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * The single owner of the transport, the single send window, and the layer-3
@@ -41,6 +44,41 @@ class MeshController private constructor(
 ) : MeshEvents {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Layer-4 "chat-priority" dispatcher. Summary generation is heavyweight
+     * (LFM inference); running it on its own single-thread, limited-parallelism
+     * dispatcher keeps it OFF the IO pool that carries socket reads/writes, so
+     * a generation in flight never starves plain-chat relay. This is the
+     * minimal "chat first" mechanism — no elaborate QoS, just isolation +
+     * single-flight (see [summaryInFlight]).
+     */
+    private val summaryDispatcher =
+        Dispatchers.IO.limitedParallelism(1)
+
+    /** Single-flight guard: ignore a second summary_req while one is running. */
+    private val summaryInFlight = AtomicBoolean(false)
+
+    /**
+     * Injected by the host (the service) before any summary_req can arrive.
+     * Null on a pure leaf or before injection — a summary_req is then ignored.
+     * Kept as a lambda so the heavyweight LEAP engine is constructed lazily and
+     * tests can supply a deterministic fake.
+     */
+    @Volatile
+    var summarizationEngineProvider: (() -> SummarizationEngine)? = null
+
+    @Volatile
+    private var resolvedEngine: SummarizationEngine? = null
+
+    /** Whether THIS device is the hub (only the hub runs the LFM). */
+    @Volatile
+    private var serverMode: Boolean = false
+
+    private val _summaryRunning = MutableStateFlow(false)
+
+    /** True while the hub is generating a summary (drives the UI spinner). */
+    val summaryRunning: StateFlow<Boolean> = _summaryRunning.asStateFlow()
 
     @Volatile
     private var transport: MeshTransport? = null
@@ -76,6 +114,7 @@ class MeshController private constructor(
      */
     suspend fun configure(serverMode: Boolean, host: String) {
         teardown()
+        this.serverMode = serverMode
         val t: MeshTransport = if (serverMode) {
             MeshServer(events = this)
         } else {
@@ -122,6 +161,92 @@ class MeshController private constructor(
             transport.sendRaw(MessageWire.encodeSyncReq(since))
         }
         flushOutbox()
+    }
+
+    // ---- Layer 4: AI summary (server-only) -------------------------------
+
+    /**
+     * A device asked for a situational summary.
+     *
+     * Server-only: only the hub holds the model and the authoritative chat
+     * history, so only the hub generates. A non-hub (leaf) ignores it — the
+     * requesting leaf reaches the hub because the hub relays nothing for
+     * summary_req; it is the hub's reader that invokes this.
+     *
+     * Returns immediately: the heavyweight generation is launched on
+     * [summaryDispatcher] so the transport reader (and thus plain-chat relay)
+     * is never blocked. [summaryInFlight] coalesces duplicate requests so a
+     * room full of devices tapping the button does not queue N generations.
+     */
+    override suspend fun onSummaryRequest(since: Long) {
+        if (!serverMode) {
+            Log.d(TAG, "Ignoring summary_req: not the hub")
+            return
+        }
+        if (!summaryInFlight.compareAndSet(false, true)) {
+            Log.i(TAG, "Summary already in flight; coalescing request")
+            return
+        }
+        // Detach from the reader: generation must not hold the read loop.
+        scope.launch(summaryDispatcher) {
+            _summaryRunning.value = true
+            try {
+                val engine = resolveEngine()
+                if (engine == null) {
+                    Log.w(TAG, "No summarization engine; dropping summary_req")
+                    return@launch
+                }
+                val window = repository.recentForSummary(
+                    SummarizationEngine.MAX_SUMMARY_MESSAGES,
+                )
+                Log.i(TAG, "Summarising ${window.size} message(s)")
+                val text = engine.summarize(window)
+                val summary = MessageWire.aiSummaryMessage(
+                    id = UUID.randomUUID().toString(),
+                    body = text,
+                    createdAt = System.currentTimeMillis(),
+                )
+                // Persist on the hub, then relay to every leaf. Leaves dedup
+                // via the DAO's OnConflict.IGNORE just like any peer message.
+                repository.acceptAiSummary(summary)
+                transport?.send(summary)
+                Log.i(TAG, "AI summary ${summary.id} stored + relayed")
+            } catch (e: Exception) {
+                Log.w(TAG, "Summary generation failed: ${e.message}")
+            } finally {
+                _summaryRunning.value = false
+                summaryInFlight.set(false)
+            }
+        }
+    }
+
+    /**
+     * UI entry point for the "状況まとめ" action.
+     *
+     * Hub: generate locally (straight into [onSummaryRequest]).
+     * Leaf: frame a summary_req onto the socket so the hub generates and the
+     * result comes back as a normal relayed AI message.
+     *
+     * @return false if a leaf has no live link to the hub (UI shows
+     *   "サーバー未接続"); the model is never run leaf-side.
+     */
+    suspend fun requestSummary(): Boolean {
+        if (serverMode) {
+            onSummaryRequest(0L)
+            return true
+        }
+        val t = transport ?: run {
+            Log.i(TAG, "requestSummary: no transport (server not connected)")
+            return false
+        }
+        return t.sendRaw(MessageWire.encodeSummaryReq())
+    }
+
+    private fun resolveEngine(): SummarizationEngine? {
+        resolvedEngine?.let { return it }
+        val built = summarizationEngineProvider?.invoke() ?: return null
+        resolvedEngine = built
+        return built
     }
 
     // ---- Outbox ----------------------------------------------------------

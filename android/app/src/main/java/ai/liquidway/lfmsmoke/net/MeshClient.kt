@@ -120,6 +120,11 @@ class MeshClient(
                             // A leaf never serves backfill (only the hub does);
                             // ignore defensively.
                             Log.d(TAG, "Ignoring sync_req on leaf")
+                        is MessageWire.Frame.SummaryReq ->
+                            // A leaf never runs the model; the hub does. The
+                            // hub does not relay summary_req, so a leaf should
+                            // not see this — ignore defensively.
+                            Log.d(TAG, "Ignoring summary_req on leaf")
                         MessageWire.Frame.Unknown -> Unit // skip; keep the link
                     }
                 }

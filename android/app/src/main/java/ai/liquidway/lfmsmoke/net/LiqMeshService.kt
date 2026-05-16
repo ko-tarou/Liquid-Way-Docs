@@ -1,6 +1,7 @@
 package ai.liquidway.lfmsmoke.net
 
 import ai.liquidway.lfmsmoke.MainActivity
+import ai.liquidway.lfmsmoke.ai.LeapSummarizationEngine
 import ai.liquidway.lfmsmoke.settings.SettingsRepository
 import android.app.Notification
 import android.app.NotificationChannel
@@ -45,6 +46,15 @@ class LiqMeshService : Service() {
         super.onCreate()
         controller = MeshController.get(this)
         settings = SettingsRepository.get(this)
+        // Layer 4: give the controller a way to build the (heavyweight) LEAP
+        // engine lazily. It is only invoked when this device is the hub AND a
+        // summary_req actually arrives, so the model is not loaded otherwise.
+        if (controller.summarizationEngineProvider == null) {
+            val app = applicationContext
+            controller.summarizationEngineProvider = {
+                LeapSummarizationEngine(app)
+            }
+        }
         createChannel()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
