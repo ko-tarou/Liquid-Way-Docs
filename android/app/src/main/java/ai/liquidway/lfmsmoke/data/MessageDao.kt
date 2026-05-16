@@ -56,6 +56,18 @@ interface MessageDao {
     suspend fun recentSince(since: Long, limit: Int): List<Message>
 
     /**
+     * Layer-4 summary window: the most recent human chat messages, excluding
+     * AI-authored summaries (so a summary never feeds back into itself),
+     * newest-first then [limit]-capped. The caller re-sorts ascending so the
+     * model reads the conversation in chat order.
+     */
+    @Query(
+        "SELECT * FROM messages WHERE senderId != :aiSenderId " +
+            "ORDER BY createdAt DESC LIMIT :limit",
+    )
+    suspend fun recentForSummary(aiSenderId: String, limit: Int): List<Message>
+
+    /**
      * Largest createdAt among messages this device did *not* author locally
      * (status != LOCAL), or null when none. This is the backfill watermark:
      * using only delivered/received rows means a leaf's own offline-queued

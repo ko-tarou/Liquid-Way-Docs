@@ -85,6 +85,24 @@ class MessageRepository(
         dao.recentSince(since, limit).asReversed()
 
     /**
+     * The recent human-chat window for layer-4 summarisation: up to [limit]
+     * most-recent non-AI messages, returned oldest-first so the model reads the
+     * conversation in chat order. AI summaries are excluded so a summary never
+     * recursively summarises prior summaries.
+     */
+    suspend fun recentForSummary(limit: Int): List<Message> =
+        dao.recentForSummary(AI_SENDER_ID, limit).asReversed()
+
+    /**
+     * Persists an AI-authored summary as a normal message (dedup via the DAO's
+     * OnConflict.IGNORE on the UUID, same as any peer message).
+     *
+     * @return true if newly stored (false == already had it; idempotent relay).
+     */
+    suspend fun acceptAiSummary(message: Message): Boolean =
+        dao.insertReturning(message) != -1L
+
+    /**
      * Backfill watermark: highest createdAt among messages received from a
      * peer (status != LOCAL), or 0 when none. Excludes this device's own
      * offline-queued LOCAL rows so they cannot mask peer messages still needed.
