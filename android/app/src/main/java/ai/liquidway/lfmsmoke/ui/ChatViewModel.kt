@@ -72,8 +72,29 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _summaryError = MutableStateFlow<String?>(null)
 
-    /** Set to a user-facing message when a summary cannot be requested. */
+    /**
+     * User-facing summary problems, from two sources merged onto one snackbar:
+     *  - leaf-side "not connected" set locally in [requestSummary], and
+     *  - hub-side generation failures pushed by [MeshController.summaryError]
+     *    (model load / inference error).
+     * The first non-null of either wins; [dismissSummaryError] clears both.
+     */
     val summaryError: StateFlow<String?> = _summaryError.asStateFlow()
+
+    init {
+        // Mirror hub-side generation failures into the local error channel so
+        // the existing snackbar shows them too (no new UI surface added).
+        viewModelScope.launch {
+            mesh.summaryError.collect { hubError ->
+                if (hubError != null && _summaryError.value == null) {
+                    _summaryError.value = hubError
+                }
+                if (hubError != null) {
+                    _summaryRequested.value = false
+                }
+            }
+        }
+    }
 
     fun send(body: String) {
         viewModelScope.launch { repository.addLocal(body) }
@@ -99,6 +120,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissSummaryError() {
         _summaryError.value = null
+        // Also clear the hub-side latch so it does not immediately re-emit
+        // the same error back into the merged channel above.
+        mesh.clearSummaryError()
     }
 
     /** Clears the local latch once a fresh AI summary message has arrived. */

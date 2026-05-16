@@ -145,4 +145,26 @@ class LfmEngine(private val context: Context) {
             wallClockTokensPerSecond = wallTps,
         )
     }
+
+    /**
+     * Releases the loaded model and frees its native memory.
+     *
+     * Uses the LEAP SDK's own `ModelRunner.unload()` (verified present in
+     * leap-sdk 0.10.6). After this the next [generate] requires [loadModel]
+     * again. A no-op if nothing is loaded, and best-effort: an unload failure
+     * is logged but never propagated, since freeing memory must not crash the
+     * hub. The downloader handle is intentionally kept (a cheap object) so a
+     * re-load does not re-query the model library from scratch.
+     */
+    suspend fun unload() {
+        val runner = modelRunner ?: return
+        try {
+            runner.unload()
+            Log.i(TAG, "Model unloaded; native memory released")
+        } catch (e: Exception) {
+            Log.w(TAG, "Model unload failed (ignored): ${e.message}")
+        } finally {
+            modelRunner = null
+        }
+    }
 }

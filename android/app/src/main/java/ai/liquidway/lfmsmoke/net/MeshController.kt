@@ -7,6 +7,7 @@ import ai.liquidway.lfmsmoke.data.MessageStatus
 import ai.liquidway.lfmsmoke.settings.SettingsRepository
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -79,6 +80,27 @@ class MeshController private constructor(
 
     /** True while the hub is generating a summary (drives the UI spinner). */
     val summaryRunning: StateFlow<Boolean> = _summaryRunning.asStateFlow()
+
+    private val _summaryError = MutableStateFlow<String?>(null)
+
+    /**
+     * Set to a user-facing string when a hub-side generation fails (model
+     * load/inference error). The UI surfaces it through the same snackbar as
+     * the leaf-side "not connected" message and then calls [clearSummaryError].
+     * Hub-only signal; a leaf only ever sees its own local "not connected".
+     */
+    val summaryError: StateFlow<String?> = _summaryError.asStateFlow()
+
+    /** Clears the hub-side error latch once the UI has shown it. */
+    fun clearSummaryError() {
+        _summaryError.value = null
+    }
+
+    // The in-flight summary coroutine. Tracked so a transport reconfigure
+    // (mode/host switch, service stop) deterministically cancels it instead
+    // of letting it run on against a torn-down transport (per-request scope).
+    @Volatile
+    private var summaryJob: Job? = null
 
     @Volatile
     private var transport: MeshTransport? = null
@@ -188,12 +210,14 @@ class MeshController private constructor(
             return
         }
         // Detach from the reader: generation must not hold the read loop.
-        scope.launch(summaryDispatcher) {
+        // Tracked in summaryJob so teardown() can cancel a stale generation.
+        summaryJob = scope.launch(summaryDispatcher) {
             _summaryRunning.value = true
             try {
                 val engine = resolveEngine()
                 if (engine == null) {
                     Log.w(TAG, "No summarization engine; dropping summary_req")
+                    _summaryError.value = "要約エンジンが利用できません"
                     return@launch
                 }
                 val window = repository.recentForSummary(
@@ -211,8 +235,13 @@ class MeshController private constructor(
                 repository.acceptAiSummary(summary)
                 transport?.send(summary)
                 Log.i(TAG, "AI summary ${summary.id} stored + relayed")
+            } catch (e: CancellationException) {
+                // A reconfigure/stop cancelled us: expected, not an error.
+                Log.i(TAG, "Summary generation cancelled (reconfigure)")
+                throw e
             } catch (e: Exception) {
                 Log.w(TAG, "Summary generation failed: ${e.message}")
+                _summaryError.value = "要約の生成に失敗しました（モデル読込/推論エラー）"
             } finally {
                 _summaryRunning.value = false
                 summaryInFlight.set(false)
@@ -299,6 +328,23 @@ class MeshController private constructor(
     private suspend fun teardown() {
         stateMirrorJob?.cancel()
         stateMirrorJob = null
+        // Per-request scope: a generation tied to the old transport must not
+        // outlive it. Cancel it before dropping the socket so it cannot relay
+        // onto a torn-down transport or leak across a mode/host switch.
+        summaryJob?.cancel()
+        summaryJob = null
+        // Defensive: if the cancel raced past the coroutine's finally, clear
+        // the single-flight latch so the next mode still accepts a request.
+        summaryInFlight.set(false)
+        _summaryRunning.value = false
+        // Idle release: if this device is no longer the hub it will not run
+        // the LFM again until reconfigured, so free its native memory now.
+        if (serverMode) {
+            resolvedEngine?.let { engine ->
+                runCatching { engine.release() }
+                    .onFailure { Log.w(TAG, "Engine release failed: ${it.message}") }
+            }
+        }
         transport?.stop()
         transport = null
         _state.value = MeshState.Idle

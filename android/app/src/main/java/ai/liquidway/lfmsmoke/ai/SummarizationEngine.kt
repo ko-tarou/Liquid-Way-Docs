@@ -30,6 +30,14 @@ interface SummarizationEngine {
      */
     suspend fun summarize(messages: List<Message>): String
 
+    /**
+     * Releases any heavyweight resources (e.g. the loaded LFM) so memory is
+     * returned while idle. Idempotent; the next [summarize] must transparently
+     * re-acquire what it needs. Default no-op: lightweight test fakes hold
+     * nothing to free, so they need not override this.
+     */
+    suspend fun release() {}
+
     companion object {
         /**
          * Upper bound on how many recent messages are fed to the model. Kept in
