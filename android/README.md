@@ -1,139 +1,136 @@
-# LFM Smoke (LEAP SDK on-device)
+# LiqMesh — disaster-time P2P chat with on-device AI summaries
 
-Minimal Kotlin + Jetpack Compose app that runs a Liquid Foundation Model
-(LFM) **on-device** via the [LEAP SDK](https://leap.liquid.ai/), as the
-technical de-risking step for LiqMesh (disaster-time P2P chat).
+LiqMesh is a Kotlin + Jetpack Compose Android app for staying coordinated when
+the internet is down. Devices on the **same Wi-Fi / phone hotspot** form a TCP
+star network and chat peer-to-peer with no server, no account, and no cloud.
+One device runs in **server (hub) mode** and additionally loads a Liquid
+Foundation Model **on-device** via the [LEAP SDK](https://leap.liquid.ai/)
+(LFM2-350M), so anyone can tap "状況まとめ" and the hub produces an offline,
+on-device situational summary of the conversation and relays it to everyone.
 
-It loads the smallest LFM text model, runs one prompt, and reports the
-generated token count, elapsed time, and tokens/second.
+The earlier LEAP smoke proof (`LfmEngine.kt`, verified end-to-end on a headless
+arm64 emulator) is preserved verbatim and is the production inference path.
 
-## What was verified against official docs
+## Architecture (4 layers)
 
-Sources: <https://leap.liquid.ai/>, <https://docs.liquid.ai/>,
-the LEAP Android quick start, the `ai.liquid.leap` Maven Central artifacts,
-and the official [Liquid4All/LeapSDK-Examples](https://github.com/Liquid4All/LeapSDK-Examples)
-repo (used to ground the exact API surface).
+1. **Foundation** — Room (`data/`) persists every message; DataStore
+   (`settings/`) holds the device id/name, server-mode toggle, and server IP;
+   the Compose UI (`ui/`) is a single chat screen + a settings screen.
+2. **P2P (same-network TCP star)** — `net/`: the hub (`MeshServer`) listens;
+   every other device (`MeshClient`) connects to it; the hub relays each frame
+   to all other peers. A foreground `LiqMeshService` keeps the socket alive in
+   the background. **Wi-Fi Direct full mesh was deliberately NOT adopted** for
+   the hackathon (auto-formed mesh / NAT traversal is out of scope — it is a
+   Vision item; this build requires one shared Wi-Fi or hotspot LAN).
+3. **Offline sync** — `MeshController`: a send that misses the socket stays
+   queued (outbox) and is replayed in order on reconnect; a freshly-joined
+   device backfills history it missed from the hub. DAO `OnConflict.IGNORE`
+   makes every path idempotent (no dup messages).
+4. **Server-only AI** — only the hub holds the model and the authoritative
+   history, so only the hub summarises. Generation runs off the relay path on
+   its own single-thread dispatcher with single-flight de-dup, so plain chat
+   keeps flowing while a summary is being generated ("chat first").
 
-| Topic | Finding |
-|---|---|
-| **Emulator support** | LEAP docs state verbatim: *"The SDK may crash on loading model bundles in emulators. Always test on a physical device."* Officially **best-effort / unsupported**; a physical device is the supported target. In practice it **did work** on a headless arm64-v8a emulator here (see Measurement results) — but treat that as not guaranteed. |
-| Gradle dependency | `ai.liquid.leap:leap-sdk:0.10.6` + `ai.liquid.leap:leap-model-downloader:0.10.6` (Maven Central, no extra repo config) |
-| Build toolchain | Kotlin 2.3+, Android Gradle Plugin 8.13+, JDK 17. This project pins AGP 8.13.2 / Kotlin 2.3.21 / Gradle 8.14. `compileSdk = 36` (forced by transitive `androidx.core 1.17.0`). |
-| minSdk / ABI | minSdk 31 (Android 12), **`arm64-v8a` only**, 3GB+ RAM recommended |
-| Model | `LFM2-350M` @ `Q8_0` — smallest LFM text model in the LEAP library; downloaded at runtime on first launch (needs network), then cached on device |
-| Generation API | `ModelRunner.createConversation().generateResponse(prompt): Flow<MessageResponse>`; collect `Chunk` for text, `Complete` for `GenerationStats` (`promptTokens`, `completionTokens`, `tokenPerSecond`) |
-| Auth / API key | **None.** On-device inference needs no API key or account; model pulls from the public LEAP model library |
+## Build / run
 
-## Project layout
+### (A) Android Studio
 
-```
-android/
-├── settings.gradle.kts
-├── build.gradle.kts            # AGP 8.13.2 / Kotlin 2.3.21
-├── gradle.properties
-├── gradle/wrapper/             # Gradle 8.14 wrapper + jar
-├── gradlew
-└── app/
-    ├── build.gradle.kts        # LEAP deps, minSdk 31, arm64-v8a
-    ├── proguard-rules.pro
-    └── src/main/
-        ├── AndroidManifest.xml
-        ├── res/values/strings.xml
-        └── java/ai/liquidway/lfmsmoke/
-            ├── LfmEngine.kt        # LEAP wrapper: download → load → generate + metrics
-            ├── SmokeViewModel.kt   # orchestration + logcat metrics emission
-            ├── SmokeScreen.kt      # Compose UI: prompt / run / response / metrics
-            └── MainActivity.kt     # entrypoint + debug smoke intent extra
-```
-
-The only hand-written, review-worthy LEAP integration is `LfmEngine.kt`,
-the LEAP blocks in `app/build.gradle.kts`, and the UI/VM glue. Everything
-else is standard Android scaffolding boilerplate.
-
-## Open in Android Studio
-
-1. Open Android Studio → **Open** → select the `android/` folder.
-2. `local.properties` is git-ignored; create it with your SDK path:
+1. **Open** → select the `android/` folder.
+2. Create the git-ignored `local.properties`:
    `sdk.dir=/Users/<you>/Library/Android/sdk`
-3. Let Gradle sync (fetches LEAP artifacts from Maven Central).
-4. **Run on a physical arm64 Android device** (developer mode + USB debugging
-   enabled). First launch downloads `LFM2-350M` (network required), then runs.
+3. Let Gradle sync (LEAP artifacts come from Maven Central; no extra repo).
+4. Run on a **physical arm64 Android device** (the supported target).
 
-## Build / run from the CLI
+### (B) Command line
 
-The system JDK may be too new for AGP; use the JBR bundled with Android Studio:
+The system JDK may be too new for AGP; use the JBR bundled with Android Studio.
 
 ```bash
 cd android
 export ANDROID_HOME="$HOME/Library/Android/sdk"
-./gradlew -Dorg.gradle.java.home="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
-  :app:assembleDebug
+./gradlew :app:assembleDebug \
+  -Dorg.gradle.java.home="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+# APK: app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Output APK: `app/build/outputs/apk/debug/app-debug.apk`
-
-### Run on a connected physical device (supported path)
+Headless emulator smoke (the AVD used here is `leap_smoke`):
 
 ```bash
+"$ANDROID_HOME/emulator/emulator" -avd leap_smoke \
+  -no-window -no-audio -gpu swiftshader_indirect &
+adb wait-for-device
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-# Headless smoke: launch with a prompt extra, results go to logcat
-adb shell am start -n ai.liquidway.lfmsmoke/.MainActivity \
-  -e smoke_prompt "Say hello to disaster responders in one short sentence."
-adb logcat -s LfmSmoke:I
+adb shell am start -n ai.liquidway.lfmsmoke/.MainActivity
 ```
 
-Look for these logcat lines (tag `LfmSmoke`):
+Run the deterministic JVM tests (relay + offline sync + layer-4 summary
+policy, no emulator needed):
 
-```
-SMOKE_RESULT  text=<generated text>
-SMOKE_METRICS generated_tokens=… prompt_tokens=… elapsed_s=… sdk_tok_s=… wall_tok_s=…
-```
-
-`sdk_tok_s` is reported by the LEAP SDK's `GenerationStats`; `wall_tok_s`
-is an independent wall-clock cross-check computed in `LfmEngine`.
-
-### Emulator note
-
-The LEAP model runtime (llama.cpp / ggml backend, shipped as `arm64-v8a`
-native libs) is documented to potentially crash when loading model bundles
-on emulators. The emulator path is attempted for completeness but is **not**
-the supported target — see the measurement section below for the actual
-observed outcome on this machine.
-
-## Measurement results
-
-Despite the official "may crash on emulator" warning, the smoke run
-**succeeded on a headless arm64-v8a emulator** on Apple Silicon
-(`system-images;android-35;google_apis;arm64-v8a`, ~2GB RAM AVD,
-`-gpu swiftshader_indirect`). No crash.
-
-Real measured values (logcat tag `LfmSmoke`, model `LFM2-350M/Q8_0`,
-2026-05-17), **not fabricated**:
-
-```
-SMOKE_RESULT  text=I see you've typed "say," but how can I assist you today?
-              If you need help with a specific topic, feel free to ask!
-SMOKE_METRICS generated_tokens=31 prompt_tokens=11 elapsed_s=2.296
-              sdk_tok_s=13.74 wall_tok_s=13.50
+```bash
+./gradlew :app:testDebugUnitTest \
+  -Dorg.gradle.java.home="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 ```
 
-LEAP engine's own breakdown (tag `LiquidInferenceEngine`) corroborates:
+## Hackathon demo (two physical phones, one shared Wi-Fi / hotspot)
 
-| Metric | Value |
-|---|---|
-| Model load time | 4.22 s |
-| Total inference time | 2.26 s @ 13.74 tok/s |
-| Prompt evaluation (11 tok) | 1.60 s @ 6.88 tok/s |
-| Generation (31 tok) | 0.66 s @ 47.19 tok/s |
-| Time to first token | 1.60 s |
+Put both phones on the **same Wi-Fi network or the same phone's hotspot**.
 
-`sdk_tok_s` (13.74) and the independent `wall_tok_s` (13.50) agree
-closely, and both match the SDK's own reported rate.
+1. **Phone A — become the hub.** Open Settings, turn **Server mode ON**.
+   The chat header shows `Hub · waiting for peers`.
+2. **Find A's IP.** On phone A: Settings (Android) → Wi-Fi → the connected
+   network → note the IPv4 address (e.g. `192.168.x.y`).
+3. **Phone B — join as a leaf.** Open Settings, leave **Server mode OFF**, and
+   enter **phone A's IP** in the server-host field. The header on both phones
+   flips to `Connected` / `Hub · 1 peer(s) connected`.
+4. **Chat both ways.** Send messages from A and from B; each appears on the
+   other within a moment (relayed through the hub).
+5. **Prove offline sync.** Put **phone B in airplane mode**, then send 1–2
+   messages on B — the header shows `… queued` (they are held LOCAL). Turn
+   airplane mode **off**; on reconnect B flushes the queue in order and also
+   backfills anything it missed. Nothing is lost or duplicated.
+6. **AI situational summary.** On either phone tap the **info icon ("状況
+   まとめ")** in the top bar. The request reaches **hub A**, A's on-device LFM
+   summarises the recent conversation, and the summary is relayed back — it
+   appears as a distinct centred card on **both** phones. (First ever summary
+   triggers the one-time model download on A; see constraints.)
 
-> Caveat: these are **emulator (swiftshader CPU)** numbers on a 2GB AVD.
-> On-device performance on real arm64 hardware will differ (typically
-> faster). The point of this run was to prove LEAP loads and generates
-> on-device end to end — which it does.
+If a summary cannot run, the app says so in a snackbar — "サーバー未接続"
+when a leaf has no link to the hub, or a model-load / inference error pushed
+from the hub. No silent failures.
 
-To reproduce, see "Run on a connected physical device" above, or the
-emulator steps in the PR description.
+## Known constraints (honest)
+
+- **Two physical phones are the real validation path.** Two emulators cannot
+  reach each other's TCP sockets (each sits behind its own user-mode SLIRP
+  NAT), so cross-device chat must be demoed on real hardware on one LAN. The
+  JVM tests prove the protocol over real loopback sockets; the headless
+  emulator only proves the app launches and the LEAP model loads/generates.
+- **Model:** `LFM2-350M` @ `Q8_0`. The **first** summary on the hub downloads
+  the model (network required once); it is then cached on device. No API key
+  or account — on-device inference only.
+- **minSdk 31, `arm64-v8a` only**, 3GB+ RAM recommended (LEAP runtime is
+  arm64 native libs; documented to possibly crash loading bundles on
+  emulators — physical device is the supported target).
+- **No automatic Wi-Fi Direct mesh.** Devices must share one Wi-Fi/hotspot and
+  the leaf must be told the hub's IP. Auto-discovery / full mesh is a Vision
+  item, not in this build.
+
+## Notes on scope
+
+This MVP was scoped to roughly **9 hours of real build time** and was kept
+deliberately tight: the four layers above plus low-risk polish (visible error
+messages, idle model release, per-request coroutine scoping). No speculative
+features were added beyond what a two-phone disaster-chat demo needs.
+
+### Polish in this build
+
+- **Visible errors:** summary failures surface in a snackbar (leaf "not
+  connected" and hub-side model/inference errors), instead of failing
+  silently in the log.
+- **Idle model release:** when a hub leaves server mode (or the service
+  stops), the controller calls the engine's `release()`, which invokes the
+  LEAP SDK's `ModelRunner.unload()` to return native memory; the next summary
+  lazily reloads.
+- **Per-request scope:** the in-flight summary coroutine is tracked and
+  cancelled on any transport reconfigure (mode/host switch, service stop) so
+  a stale generation can never relay onto a torn-down socket or leak.
