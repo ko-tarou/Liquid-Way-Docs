@@ -105,6 +105,16 @@ class MeshController private constructor(
     @Volatile
     private var transport: MeshTransport? = null
 
+    /**
+     * Stage-1 bridge: the secondary outbound link to a *second* hub, present
+     * only when this device is a hub AND bridging is enabled+configured. Null in
+     * every other case — and null is the whole zero-regression story: when the
+     * bridge is absent, [ingest]/[onMessage]/[sendLocal] take exactly the
+     * pre-bridge code paths, so the star behaves byte-for-byte as before.
+     */
+    @Volatile
+    private var bridge: MeshClient? = null
+
     // Cancelled on every reconfigure so a stale transport's StateFlow can't
     // keep feeding the controller's stream.
     private var stateMirrorJob: Job? = null
@@ -132,9 +142,19 @@ class MeshController private constructor(
 
     /**
      * (Re)configures the transport for the given mode. Safe to call on every
-     * settings change: it tears down the previous transport first.
+     * settings change: it tears down the previous transport (and bridge) first.
+     *
+     * The Stage-1 bridge is created ONLY when this device is a hub AND bridging
+     * is both enabled and pointed at a host. In every other combination [bridge]
+     * stays null — including the default (bridgeEnabled=false) — so the
+     * pre-bridge star behaviour is reproduced exactly (zero regression).
      */
-    suspend fun configure(serverMode: Boolean, host: String) {
+    suspend fun configure(
+        serverMode: Boolean,
+        host: String,
+        bridgeEnabled: Boolean = false,
+        bridgeHost: String = "",
+    ) {
         teardown()
         this.serverMode = serverMode
         val t: MeshTransport = if (serverMode) {
@@ -151,14 +171,77 @@ class MeshController private constructor(
         // Mirror the transport's state into the controller's stream.
         stateMirrorJob = scope.launch { t.state.collect { _state.value = it } }
         t.start()
-        Log.i(TAG, "Configured serverMode=$serverMode host='$host'")
+
+        // Bridge: a hub-only secondary link to a second hub. Default OFF means
+        // this branch is skipped and `bridge` stays null.
+        if (serverMode && bridgeEnabled && bridgeHost.isNotBlank()) {
+            val b = MeshClient(
+                host = bridgeHost,
+                events = this,
+                role = MeshClient.Role.BRIDGE,
+                deviceId = settings.deviceId(),
+            )
+            bridge = b
+            b.start()
+            Log.i(TAG, "Bridge enabled -> $bridgeHost")
+        }
+        Log.i(TAG, "Configured serverMode=$serverMode host='$host' bridge=${bridge != null}")
     }
 
     // ---- MeshEvents ------------------------------------------------------
 
-    /** Persist an inbound peer message. Returns true if it was new. */
-    override suspend fun onMessage(message: Message): Boolean =
-        repository.acceptRemote(message)
+    /**
+     * Persist an inbound peer message. Returns true if it was new.
+     *
+     * Called from the hub's [MeshServer] reader for a LEAF-origin message. As
+     * well as persisting, a hub with a live [bridge] forwards it to the second
+     * hub (the A->B direction). The far hub's own [MeshServer] handles the
+     * reverse (B->A) so the two forwarding paths never both fire on one hub.
+     * Leaf-origin frames are hop 0 / no origin, so the bridge stamps hop 1.
+     */
+    override suspend fun onMessage(message: Message): Boolean {
+        val isNew = repository.acceptRemote(message)
+        forwardToBridge(message, hop = 0, originId = null)
+        return isNew
+    }
+
+    /**
+     * Unified inbound for a [MeshClient]: a PRIMARY leaf just persists; a BRIDGE
+     * link persists AND fans the far-hub message out to this hub's local leaves.
+     */
+    override suspend fun ingest(
+        message: Message,
+        hop: Int,
+        originId: String?,
+        fromBridge: Boolean,
+    ) {
+        if (!fromBridge) {
+            // PRIMARY leaf: the hub owns fan-out, a leaf only stores.
+            repository.acceptRemote(message)
+            return
+        }
+        // BRIDGE inbound: persist, then relay to our local leaves via the
+        // primary transport (the hub's MeshServer). We deliberately do NOT push
+        // it back across the bridge it arrived on; the seen-set would refuse it
+        // anyway, but excluding the inbound edge is the structural guard.
+        val isNew = repository.acceptRemote(message)
+        if (isNew) transport?.send(message)
+        else Log.d(TAG, "Duplicate ${message.id} from bridge; not re-fanned")
+    }
+
+    /**
+     * A->B forwarding chokepoint. No-op unless this hub has a live [bridge].
+     * Asks the loop-prevention policy whether (and at what hop) to cross; on a
+     * non-null answer, frames the message onto the bridge with hop+1 and an
+     * origin stamp. Shared by [onMessage] (leaf-origin) and [sendLocal]
+     * (self-origin) so every locally-visible message reaches the second hub once.
+     */
+    private suspend fun forwardToBridge(message: Message, hop: Int, originId: String?) {
+        val b = bridge ?: return
+        val nextHop = bridgePolicy.bridgeHopFor(message.id, hop) ?: return
+        val stampedOrigin = originId ?: message.senderId
+        b.sendRaw(MessageWire.encode(message, hop = nextHop, originId = stampedOrigin))
+    }
 
     /**
      * Answer a peer's backfill request: replay our messages created after
@@ -178,6 +261,12 @@ class MeshController private constructor(
      * to push proactively, so for it this is a no-op beyond a log line.
      */
     override suspend fun onLinkEstablished(transport: MeshTransport) {
+        // The bridge link is this controller's own secondary MeshClient. It is
+        // NOT a leaf-to-hub link, so it must not drive leaf-side catch-up
+        // (sync_req / outbox flush) — that would let one hub's outbox spill onto
+        // the second hub. Bridge catch-up (history merge across hubs) is a later
+        // PR; here the bridge only carries live forwarded chat.
+        if (transport === bridge) return
         if (transport is MeshClient) {
             val since = repository.latestCreatedAt()
             transport.sendRaw(MessageWire.encodeSyncReq(since))
@@ -234,6 +323,8 @@ class MeshController private constructor(
                 // via the DAO's OnConflict.IGNORE just like any peer message.
                 repository.acceptAiSummary(summary)
                 transport?.send(summary)
+                // Also cross to the second hub so its leaves see the summary.
+                forwardToBridge(summary, hop = 0, originId = null)
                 Log.i(TAG, "AI summary ${summary.id} stored + relayed")
             } catch (e: CancellationException) {
                 // A reconfigure/stop cancelled us: expected, not an error.
@@ -348,6 +439,9 @@ class MeshController private constructor(
         } else {
             Log.d(TAG, "Send returned false; ${message.id} stays LOCAL (outbox)")
         }
+        // A self-authored message also crosses to the second hub (hop 0 -> 1).
+        // No-op when no bridge is configured.
+        forwardToBridge(message, hop = 0, originId = null)
     }
 
     private suspend fun teardown() {
@@ -372,6 +466,10 @@ class MeshController private constructor(
         }
         transport?.stop()
         transport = null
+        // Tear the bridge down too so a mode/host/bridge change cannot leave a
+        // stale inter-hub socket forwarding onto a torn-down transport.
+        bridge?.stop()
+        bridge = null
         _state.value = MeshState.Idle
     }
 

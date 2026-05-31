@@ -66,12 +66,25 @@ class LiqMeshService : Service() {
             startForeground(NOTIF_ID, buildNotification("Starting…"))
         }
 
-        // Reconfigure the transport on any (mode, host) change.
-        combine(settings.serverMode, settings.serverHost) { mode, host -> mode to host }
+        // Reconfigure the transport on any (mode, host, bridge) change. The
+        // bridge fields are folded in so toggling the bridge (or editing its
+        // host) re-homes the mesh live, exactly like the server-mode/host flow.
+        combine(
+            settings.serverMode,
+            settings.serverHost,
+            settings.bridgeEnabled,
+            settings.bridgeHost,
+        ) { mode, host, bridgeEnabled, bridgeHost ->
+            MeshConfig(mode, host, bridgeEnabled, bridgeHost)
+        }
             .distinctUntilChanged()
-            .onEach { (mode, host) ->
-                Log.i(TAG, "Settings -> serverMode=$mode host='$host'")
-                controller.configure(mode, host)
+            .onEach { cfg ->
+                Log.i(
+                    TAG,
+                    "Settings -> serverMode=${cfg.serverMode} host='${cfg.host}' " +
+                        "bridgeEnabled=${cfg.bridgeEnabled} bridgeHost='${cfg.bridgeHost}'",
+                )
+                controller.configure(cfg.serverMode, cfg.host, cfg.bridgeEnabled, cfg.bridgeHost)
             }
             .launchIn(scope)
 
@@ -146,6 +159,18 @@ class LiqMeshService : Service() {
         }
     }
 }
+
+/**
+ * The full transport configuration the service watches. A value class so
+ * [distinctUntilChanged] suppresses re-configure unless something actually
+ * changed (cheap structural equality across the four settings).
+ */
+private data class MeshConfig(
+    val serverMode: Boolean,
+    val host: String,
+    val bridgeEnabled: Boolean,
+    val bridgeHost: String,
+)
 
 /** Human-readable one-liner for the notification / future UI reuse. */
 private fun MeshState.describe(): String = when (this) {

@@ -20,6 +20,23 @@ interface MeshEvents {
     suspend fun onMessage(message: Message): Boolean
 
     /**
+     * Unified inbound entry point for a chat [Message] arriving on a
+     * [MeshClient] socket, carrying its Stage-1 bridge envelope.
+     *
+     *  - PRIMARY leaf (`fromBridge=false`): equivalent to [onMessage] — just
+     *    persist; the hub owns fan-out so a leaf never relays.
+     *  - BRIDGE link (`fromBridge=true`): far-hub chat reaching THIS hub. The
+     *    controller persists it (DAO dedup) and fans it out to this hub's local
+     *    leaves through the primary transport. It is NOT sent back across the
+     *    bridge it arrived on (the seen-set would refuse it anyway, but the
+     *    inbound edge is excluded by construction).
+     *
+     * [hop]/[originId] are the sender's untrusted self-report, used only for
+     * loop prevention; never for trust or routing decisions beyond the policy.
+     */
+    suspend fun ingest(message: Message, hop: Int, originId: String?, fromBridge: Boolean)
+
+    /**
      * A peer asked for backfill: everything we hold created after [since].
      * [reply] frames each missing message back to *that one* peer.
      */

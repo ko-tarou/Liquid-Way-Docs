@@ -33,6 +33,8 @@ class SettingsRepository(context: Context) {
         val DEVICE_ID = stringPreferencesKey("device_id")
         val DEVICE_NAME = stringPreferencesKey("device_name")
         val SERVER_HOST = stringPreferencesKey("server_host")
+        val BRIDGE_ENABLED = booleanPreferencesKey("bridge_enabled")
+        val BRIDGE_HOST = stringPreferencesKey("bridge_host")
     }
 
     val serverMode: Flow<Boolean> =
@@ -45,6 +47,26 @@ class SettingsRepository(context: Context) {
      */
     val serverHost: Flow<String> =
         dataStore.data.map { it[Keys.SERVER_HOST] ?: "" }
+
+    /**
+     * Stage-1 bridge: whether THIS hub also links to a *second* hub so the two
+     * star networks merge into one chat. Default **false** — when off, the
+     * networking layer never creates a bridge transport, so behaviour is
+     * byte-for-byte identical to the pre-bridge star (zero regression).
+     *
+     * Only meaningful when [serverMode] is on (a leaf has nothing to bridge);
+     * the UI hides it otherwise and [MeshController] gates on serverMode too.
+     */
+    val bridgeEnabled: Flow<Boolean> =
+        dataStore.data.map { it[Keys.BRIDGE_ENABLED] ?: false }
+
+    /**
+     * The peer hub's LAN IP this hub bridges to. Only ONE of the two hubs sets
+     * this (the other leaves it blank) so there is exactly one inter-hub TCP
+     * link — setting it on both would create a duplicate link. Empty until set.
+     */
+    val bridgeHost: Flow<String> =
+        dataStore.data.map { it[Keys.BRIDGE_HOST] ?: "" }
 
     /**
      * Emits the persisted device name. On first run no name is stored yet, so
@@ -66,6 +88,14 @@ class SettingsRepository(context: Context) {
 
     suspend fun setServerHost(host: String) {
         dataStore.edit { it[Keys.SERVER_HOST] = host.trim() }
+    }
+
+    suspend fun setBridgeEnabled(enabled: Boolean) {
+        dataStore.edit { it[Keys.BRIDGE_ENABLED] = enabled }
+    }
+
+    suspend fun setBridgeHost(host: String) {
+        dataStore.edit { it[Keys.BRIDGE_HOST] = host.trim() }
     }
 
     /** Current resolved hub host (empty string if unset). */

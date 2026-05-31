@@ -21,11 +21,20 @@ import java.net.InetSocketAddress
 import java.net.Socket
 
 /**
- * A leaf node (serverMode = OFF) that maintains a single socket to the hub.
+ * A single outbound socket to a hub, used in two roles:
+ *
+ *  - [Role.PRIMARY] — a leaf (serverMode = OFF) reaching its hub. Inbound lines
+ *    are decoded and persisted via [MeshEvents]; there is no relay (the hub owns
+ *    fan-out). This is the unchanged layer-2/3 behaviour.
+ *  - [Role.BRIDGE] — Stage-1 bridge: a *hub* reaching a *second* hub so the two
+ *    star networks merge. On connect it announces itself with a
+ *    [MessageWire.Frame.BridgeHello] so the far hub marks this link `isBridge`
+ *    and forwards across it (PR#3). Inbound chat from the far hub is funnelled
+ *    into [MeshEvents.ingest] with `fromBridge=true` so the owning controller
+ *    can persist it and fan it out to THIS hub's local leaves.
  *
  * A supervised loop keeps reconnecting with a capped backoff so a hub restart
- * or transient Wi-Fi blip self-heals. Inbound lines are decoded to frames and
- * dispatched to [events]; there is no relay (the hub owns fan-out).
+ * or transient Wi-Fi blip self-heals.
  *
  * Layer 3: each time the socket comes up, [MeshEvents.onLinkEstablished] is
  * invoked so the controller can flush the outbox and request backfill. Messages
@@ -36,7 +45,16 @@ class MeshClient(
     private val host: String,
     private val port: Int = MessageWire.DEFAULT_PORT,
     private val events: MeshEvents,
+    private val role: Role = Role.PRIMARY,
+    /**
+     * BRIDGE role only: this hub's own deviceId, sent in the opening
+     * [MessageWire.Frame.BridgeHello]. Null for a PRIMARY leaf (no hello).
+     */
+    private val deviceId: String? = null,
 ) : MeshTransport {
+
+    /** The two ways a single outbound socket is used. See the class doc. */
+    enum class Role { PRIMARY, BRIDGE }
 
     private companion object {
         const val TAG = "LiqMesh/Client"
@@ -101,7 +119,15 @@ class MeshClient(
             out = s.getOutputStream()
             backoff = MIN_BACKOFF_MS
             _state.value = MeshState.Connected(host, port)
-            Log.i(TAG, "Connected to $host:$port")
+            Log.i(TAG, "Connected to $host:$port (role=$role)")
+
+            // BRIDGE role: announce ourselves so the far hub flips this link to
+            // isBridge=true and forwards chat across it (the B->A direction).
+            // Sent inline before onLinkEstablished so the hello is the first
+            // line the far hub reads on this connection.
+            if (role == Role.BRIDGE) {
+                sendRaw(MessageWire.encodeBridgeHello(deviceId ?: "bridge"))
+            }
 
             // Layer 3: drain the outbox and ask the hub for anything we missed
             // while offline. Done off the reader path so a slow flush cannot
@@ -115,7 +141,18 @@ class MeshClient(
                 while (scope.isActive) {
                     val line = reader.readLine() ?: break
                     when (val f = MessageWire.decodeFrame(line)) {
-                        is MessageWire.Frame.Msg -> events.onMessage(f.message)
+                        is MessageWire.Frame.Msg ->
+                            // PRIMARY leaf: just persist (the hub owns fan-out).
+                            // BRIDGE: funnel far-hub chat into the unified ingest
+                            // so the controller persists it AND fans it out to
+                            // this hub's local leaves. fromBridge marks the inbound
+                            // edge so it is never echoed back across this bridge.
+                            events.ingest(
+                                f.message,
+                                hop = f.hop,
+                                originId = f.originId,
+                                fromBridge = role == Role.BRIDGE,
+                            )
                         is MessageWire.Frame.SyncReq ->
                             // A leaf never serves backfill (only the hub does);
                             // ignore defensively.

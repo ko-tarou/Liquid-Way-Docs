@@ -27,6 +27,12 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     val serverHost: StateFlow<String> = settings.serverHost
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "")
 
+    val bridgeEnabled: StateFlow<Boolean> = settings.bridgeEnabled
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    val bridgeHost: StateFlow<String> = settings.bridgeHost
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "")
+
     val deviceId: StateFlow<String> = kotlinx.coroutines.flow.flow {
         emit(settings.deviceId())
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "")
@@ -41,5 +47,13 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setServerHost(host: String) {
         viewModelScope.launch { settings.setServerHost(host) }
+    }
+
+    fun setBridgeEnabled(enabled: Boolean) {
+        viewModelScope.launch { settings.setBridgeEnabled(enabled) }
+    }
+
+    fun setBridgeHost(host: String) {
+        viewModelScope.launch { settings.setBridgeHost(host) }
     }
 }
