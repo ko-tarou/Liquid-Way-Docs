@@ -19,7 +19,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The single owner of the transport, the single send window, and the layer-3
@@ -59,6 +61,37 @@ class MeshController private constructor(
 
     /** Single-flight guard: ignore a second summary_req while one is running. */
     private val summaryInFlight = AtomicBoolean(false)
+
+    /**
+     * Operator-layer: total summaries this hub has produced. Incremented once per
+     * completed generation and piggybacked on the bridge heartbeat as
+     * [HubLoad.dispatchCount] so peers can see this hub's lifetime workload. A
+     * monotonic counter feeding future load-based dispatch hints (later PR).
+     */
+    private val dispatchCount = AtomicInteger(0)
+
+    /**
+     * Operator-layer: the latest load each peer hub reported on its bridge
+     * heartbeat, keyed by deviceId. Updated from the transport reader threads
+     * (so a [ConcurrentHashMap]); exposed read-only via [peerLoadView] for a
+     * later PR to base operator selection on. Empty on a single hub (no bridge,
+     * no hellos) — the zero-regression case.
+     */
+    private val peerLoads = ConcurrentHashMap<String, PeerLoad>()
+
+    /**
+     * A peer hub's last-reported load plus when we heard it. [seenAt] lets a
+     * later PR age out a silent peer (a hub whose heartbeat stopped) instead of
+     * trusting stale load forever.
+     */
+    data class PeerLoad(val load: HubLoad, val seenAt: Long)
+
+    /**
+     * Read-only snapshot of every peer hub's last-reported load. A defensive copy
+     * so a caller cannot mutate the live map. Consumed by a later PR (operator
+     * selection); this PR only populates it.
+     */
+    fun peerLoadView(): Map<String, PeerLoad> = peerLoads.toMap()
 
     /**
      * Layer-6 per-question ownership: lets a `summary_req` cross the bridge so
@@ -205,11 +238,15 @@ class MeshController private constructor(
         // Bridge: a hub-only secondary link to a second hub. Default OFF means
         // this branch is skipped and `bridge` stays null.
         if (serverMode && bridgeEnabled && bridgeHost.isNotBlank()) {
+            // Resolve + cache our deviceId now so the MeshServer's echoed hello
+            // (operator-layer load) can stamp it without suspending on the
+            // reader path (see [localDeviceId]).
+            val selfDeviceId = settings.deviceId().also { cachedSelfId = it }
             val b = MeshClient(
                 host = bridgeHost,
                 events = this,
                 role = MeshClient.Role.BRIDGE,
-                deviceId = settings.deviceId(),
+                deviceId = selfDeviceId,
             )
             bridge = b
             // Reflect the bridge link's own connect/disconnect/reconnect into the
@@ -330,6 +367,37 @@ class MeshController private constructor(
     override suspend fun bridgeWatermark(): Long = repository.latestCreatedAt()
 
     /**
+     * Operator-layer: this hub's current load, stamped onto every outgoing
+     * bridge_hello. [HubLoad.queueDepth] is derived from [summaryInFlight] — with
+     * single-flight summarisation the summariser is either idle (0) or busy (1),
+     * which is the honest "current pressure" signal without inventing a queue
+     * that does not exist. [HubLoad.dispatchCount] is the lifetime total.
+     */
+    override fun localLoad(): HubLoad = HubLoad(
+        queueDepth = if (summaryInFlight.get()) 1 else 0,
+        dispatchCount = dispatchCount.get(),
+    )
+
+    /**
+     * Operator-layer: record a peer hub's load reported on its bridge heartbeat.
+     * Read-only view today (no routing consumes it); a later PR uses it for
+     * load-based operator selection. Overwrites with the latest report + a fresh
+     * timestamp so a silent peer can be aged out later.
+     */
+    override suspend fun onPeerLoad(deviceId: String, load: HubLoad) {
+        peerLoads[deviceId] = PeerLoad(load, System.currentTimeMillis())
+        Log.d(TAG, "Peer $deviceId load: queue=${load.queueDepth} dispatched=${load.dispatchCount}")
+    }
+
+    /**
+     * Operator-layer: this hub's deviceId for the [MeshServer]'s echoed hello.
+     * Non-suspending (the reader path cannot suspend cheaply), so it reads the
+     * id cached by [configure]/[selfId]; falls back to "hub" only before the
+     * first resolution (a bridged hub caches it on configure).
+     */
+    override fun localDeviceId(): String = cachedSelfId ?: "hub"
+
+    /**
      * Fold the A-side bridge MeshClient's liveness into a [MeshState.Hub] so the
      * notification can show the inter-hub bridge as up / down / reconnecting.
      *
@@ -428,6 +496,9 @@ class MeshController private constructor(
                 transport?.send(summary)
                 // Also cross to the second hub so its leaves see the summary.
                 forwardToBridge(summary, hop = 0, originId = null)
+                // Operator-layer: count this completed dispatch so the next
+                // heartbeat advertises the updated lifetime workload.
+                dispatchCount.incrementAndGet()
                 Log.i(TAG, "AI summary ${summary.id} stored + relayed")
             } catch (e: CancellationException) {
                 // A reconfigure/stop cancelled us: expected, not an error.
