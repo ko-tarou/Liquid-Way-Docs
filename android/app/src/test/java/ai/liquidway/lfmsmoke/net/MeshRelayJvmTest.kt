@@ -119,6 +119,19 @@ class MeshRelayJvmTest {
         private val summaryInFlight = AtomicBoolean(false)
         val summaryRunning = AtomicBoolean(false)
 
+        // ---- Operator-layer load (mirrors MeshController) -----------------
+        // This hub's advertised load, settable by a test to simulate pressure.
+        @Volatile
+        var selfLoad = HubLoad()
+        // Per-peer last-reported load, populated by onPeerLoad from heartbeats.
+        val peerLoads = ConcurrentHashMap<String, HubLoad>()
+
+        override fun localLoad(): HubLoad = selfLoad
+        override fun localDeviceId(): String = deviceId
+        override suspend fun onPeerLoad(deviceId: String, load: HubLoad) {
+            peerLoads[deviceId] = load
+        }
+
         fun put(m: Message): Boolean {
             val prev = store.putIfAbsent(m.id, m)
             return prev == null
@@ -1188,6 +1201,89 @@ class MeshRelayJvmTest {
         } finally {
             leafA?.stop(); leafB?.stop(); bridge?.stop()
             serverA.stop(); serverB.stop()
+        }
+    }
+
+    // ---- Operator layer 1: piggyback load metrics on the heartbeat ---------
+    //
+    // queueDepth/dispatchCount ride the EXISTING bridge_hello heartbeat (no new
+    // frame, no new timer). Each hub stamps its own load on every hello; the far
+    // hub records it in a per-peer view. Load is shared BOTH ways: A learns B's
+    // from B's echoed hello, B learns A's from A's heartbeat. This PR only SHARES
+    // the view — nothing routes on it yet (operator selection is a later PR).
+
+    @Test
+    fun bridgeHelloRoundTripsLoadMetricsAndDefaultsToZero() {
+        // Metrics present: preserved exactly through encode -> decode.
+        val withLoad = MessageWire.decodeFrame(
+            MessageWire.encodeBridgeHello("hub-7", queueDepth = 3, dispatchCount = 11),
+        ) as MessageWire.Frame.BridgeHello
+        assertEquals("hub-7", withLoad.deviceId)
+        assertEquals(3, withLoad.queueDepth)
+        assertEquals(11, withLoad.dispatchCount)
+        // Legacy hello (no metric keys at all): decodes as idle / zero load.
+        val legacy = """{"type":"bridge_hello","deviceId":"old-hub"}"""
+        val f = MessageWire.decodeFrame(legacy) as MessageWire.Frame.BridgeHello
+        assertEquals("old-hub", f.deviceId)
+        assertEquals(0, f.queueDepth)
+        assertEquals(0, f.dispatchCount)
+    }
+
+    @Test
+    fun heartbeatPropagatesLoadMetricsToBothPeersAcrossTheBridge() = runBlocking {
+        // Give each hub a distinct, non-trivial load BEFORE the bridge comes up,
+        // so the very first hello (and its echo) already carries real numbers.
+        val f = startTwoHubs()
+        try {
+            f.hubA.selfLoad = HubLoad(queueDepth = 1, dispatchCount = 7)
+            f.hubB.selfLoad = HubLoad(queueDepth = 2, dispatchCount = 4)
+            // A's BRIDGE client re-sends its hello every 5s; B echoes its own
+            // hello (with B's load) back on the same connection. Within a couple
+            // of heartbeats both sides must hold the other's reported load.
+            await("B recorded A's load", timeoutMs = 12_000) {
+                f.hubB.peerLoads["hub-A"] == HubLoad(1, 7)
+            }
+            await("A recorded B's load", timeoutMs = 12_000) {
+                f.hubA.peerLoads["hub-B"] == HubLoad(2, 4)
+            }
+            // Updated load propagates on the NEXT heartbeat (no extra traffic).
+            f.hubA.selfLoad = HubLoad(queueDepth = 0, dispatchCount = 9)
+            await("B saw A's updated load", timeoutMs = 12_000) {
+                f.hubB.peerLoads["hub-A"] == HubLoad(0, 9)
+            }
+        } finally {
+            f.close()
+        }
+    }
+
+    @Test
+    fun singleHubKeepsAnEmptyPeerLoadViewAndUnchangedRouting() = runBlocking {
+        // Zero-regression: with NO bridge, no bridge_hello is ever sent, so the
+        // peer-load view stays empty and plain relay is byte-for-byte unchanged.
+        val hub = FakePeer("hub", deviceId = "hub-solo")
+        hub.selfLoad = HubLoad(queueDepth = 5, dispatchCount = 5) // would-be load
+        val bPeer = FakePeer("B")
+        val server = startHub(hub)
+        var clientA: MeshClient? = null
+        var clientB: MeshClient? = null
+        try {
+            val port = server.boundPort
+            clientA = MeshClient("127.0.0.1", port, FakePeer("A"))
+            clientB = MeshClient("127.0.0.1", port, bPeer)
+            clientA.start(); clientB.start()
+            await("2 peers") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 2
+            }
+            // Plain leaf->leaf relay still works exactly as before.
+            assertTrue(clientA.send(msg("solo-1", "hi B", "device-A")))
+            await("B received") { bPeer.store.containsKey("solo-1") }
+            Thread.sleep(200)
+            // No hello was exchanged (no bridge), so no peer load was recorded
+            // on any party, despite the hub having a non-zero would-be load.
+            assertTrue("hub peer view empty", hub.peerLoads.isEmpty())
+            assertTrue("B peer view empty", bPeer.peerLoads.isEmpty())
+        } finally {
+            clientA?.stop(); clientB?.stop(); server.stop()
         }
     }
 
