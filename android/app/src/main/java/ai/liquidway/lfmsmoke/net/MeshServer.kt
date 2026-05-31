@@ -74,6 +74,18 @@ class MeshServer(
         val out: OutputStream = socket.getOutputStream()
         // Serialises concurrent writes (local fan-out vs. relay) to this peer.
         val writeLock = Any()
+
+        /**
+         * Stage-1 bridge: true once this peer announces itself with a
+         * [MessageWire.Frame.BridgeHello] (i.e. it is another hub reached over a
+         * bridge link, not a plain leaf). Flipped from the per-connection reader
+         * coroutine and read from any reader during relay, so @Volatile.
+         *
+         * No bridge transport is wired until PR#4, so in production this stays
+         * false; PR#3's tests drive it by sending a bridge_hello frame.
+         */
+        @Volatile
+        var isBridge: Boolean = false
     }
 
     override suspend fun start() {
@@ -131,11 +143,11 @@ class MeshServer(
                     when (val f = MessageWire.decodeFrame(line)) {
                         is MessageWire.Frame.Msg -> {
                             val isNew = events.onMessage(f.message)
-                            // Relay to every *other* client so the star behaves
-                            // as a bus. Dedup is the leaves' job (DAO
-                            // OnConflict.IGNORE); relaying unconditionally keeps
-                            // the hub stateless and simple.
-                            relay(f.message, exclude = conn.id)
+                            // Relay to every *other* client. Local leaves get an
+                            // unconditional fan-out (unchanged star behaviour);
+                            // bridge connections get policy-gated forwarding with
+                            // hop+1. The sender is always excluded.
+                            relay(f.message, hop = f.hop, originId = f.originId, exclude = conn)
                             if (!isNew) Log.d(TAG, "Duplicate ${f.message.id} re-relayed")
                         }
                         is MessageWire.Frame.SyncReq -> {
@@ -153,9 +165,17 @@ class MeshServer(
                             // plain chat while a summary is produced.
                             events.onSummaryRequest(f.since)
                         }
-                        // Stage-1 bridge frames + Unknown: no relay path consumes
-                        // them yet, so skip without dropping the link.
-                        is MessageWire.Frame.BridgeHello,
+                        is MessageWire.Frame.BridgeHello -> {
+                            // This peer is another hub reached over a bridge,
+                            // not a leaf. Mark the connection so relay() routes
+                            // it through the forwarding policy instead of the
+                            // plain leaf fan-out. deviceId is logged only;
+                            // ownership/identity checks land in a later PR.
+                            conn.isBridge = true
+                            Log.i(TAG, "Client ${conn.id} is a bridge (deviceId=${f.deviceId})")
+                        }
+                        // Remaining Stage-1 frame + Unknown: no relay path
+                        // consumes them yet, so skip without dropping the link.
                         is MessageWire.Frame.SummaryClaim,
                         MessageWire.Frame.Unknown,
                         -> Unit
@@ -169,11 +189,41 @@ class MeshServer(
         }
     }
 
-    private fun relay(message: Message, exclude: Long) {
-        val line = MessageWire.encode(message)
+    /**
+     * Relay an inbound chat message to every *other* connection, split by peer
+     * kind:
+     *
+     *  - **Local leaves** (isBridge=false): unconditional fan-out of the message
+     *    as-is, exactly as the star always did. This path is unchanged — no
+     *    policy, no hop rewrite — so leaf↔leaf relay has zero regression.
+     *  - **Bridge connections** (isBridge=true): policy-gated forwarding. The
+     *    forwarding decision ([bridgeHopFor]) returns the new hop, or null to
+     *    drop (already-forwarded loop break / hop ceiling). On a forward the
+     *    frame is re-encoded with hop+1 and an [originId] stamp.
+     *
+     * The receiving connection is always excluded, so a message never echoes
+     * back to its sender (this is also the bridge self-loop guard).
+     *
+     * SECURITY NOTE: [hop]/[originId] are the sender's self-report and are not
+     * authenticated here. Loop safety rests on two independent guards in
+     * [BridgePolicy] — a seen-set and a hop ceiling — not on trusting the sender.
+     * Anti-spoofing of these fields is out of scope for this PR (Stage-1 PR#6).
+     */
+    private fun relay(message: Message, hop: Int, originId: String?, exclude: Connection) {
+        // Leaf fan-out: the original star behaviour, computed once and shared.
+        val leafLine: String by lazy { MessageWire.encode(message) }
         for ((id, conn) in clients) {
-            if (id == exclude) continue
-            writeTo(conn, line)
+            if (id == exclude.id) continue
+            if (!conn.isBridge) {
+                writeTo(conn, leafLine)
+                continue
+            }
+            // Bridge forward: ask the policy whether (and at what hop) to cross.
+            val nextHop = events.bridgeHopFor(message.id, hop) ?: continue
+            // First crossing of a leaf-authored message records its origin; an
+            // already-stamped origin is preserved across further hops.
+            val stampedOrigin = originId ?: message.senderId
+            writeTo(conn, MessageWire.encode(message, hop = nextHop, originId = stampedOrigin))
         }
     }
 
