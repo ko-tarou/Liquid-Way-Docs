@@ -168,11 +168,13 @@ class MeshServer(
                             }
                         }
                         is MessageWire.Frame.SummaryReq -> {
-                            // Layer 4: the hub owns the model. onSummaryRequest
+                            // Layer 4/6: the hub owns the model. onSummaryRequest
                             // returns fast (it dispatches generation onto its
                             // own coroutine) so this read loop keeps relaying
-                            // plain chat while a summary is produced.
-                            events.onSummaryRequest(f.since)
+                            // plain chat while a summary is produced. The
+                            // questionId (layer 6) lets per-request ownership
+                            // dedup the answer to one across the bridge.
+                            events.onSummaryRequest(f.since, f.questionId)
                         }
                         is MessageWire.Frame.BridgeHello -> {
                             // This peer is another hub reached over a bridge,
@@ -196,9 +198,27 @@ class MeshServer(
                                 Log.i(TAG, "Client ${conn.id} is a bridge (deviceId=${f.deviceId}); requested backfill since=$since")
                             }
                         }
-                        // Remaining Stage-1 frame + Unknown: no relay path
-                        // consumes them yet, so skip without dropping the link.
-                        is MessageWire.Frame.SummaryClaim,
+                        is MessageWire.Frame.SummaryClaim -> {
+                            // Layer 6: a peer hub (across the bridge) claimed a
+                            // question. The controller records it so a pending
+                            // local generation stands down (or, on a cross-ack,
+                            // both answer).
+                            //
+                            // A claim is hub-to-hub control: accept it ONLY from a
+                            // bridge connection. We do not honour claims from a
+                            // plain leaf — an untrusted leaf forging summary_claim
+                            // frames could poison every questionId's ownership and
+                            // suppress all answers (a DoS). Same root cause as
+                            // Task #21; ignore (log only) without dropping the link,
+                            // matching the Unknown-frame tone below.
+                            if (conn.isBridge) {
+                                events.onSummaryClaim(f.questionId, f.ownerId)
+                            } else {
+                                Log.d(TAG, "Ignoring summary_claim from non-bridge client ${conn.id}")
+                            }
+                        }
+                        // Unknown: no relay path consumes it; skip without
+                        // dropping the link.
                         MessageWire.Frame.Unknown,
                         -> Unit
                     }

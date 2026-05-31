@@ -85,12 +85,17 @@ class MeshRelayJvmTest {
         private val engine: SummarizationEngine? = null,
         // The hub relays the produced summary through this transport.
         var relayTransport: MeshTransport? = null,
+        // This hub's stable id, stamped on its summary_claim (layer 6).
+        private val deviceId: String = name,
     ) : MeshEvents {
         val store = ConcurrentHashMap<String, Message>()
         // Mirrors MeshController.bridgePolicy: the hub forwards across a bridge
         // through this real policy (seen-set + hop ceiling), so the loop and
         // ceiling guards exercised here are the production logic.
         val bridgePolicy = BridgePolicy()
+        // Mirrors MeshController.questionOwnership: the REAL per-question
+        // single-ownership logic (forward-once + claim CAS + cross-ack + cap).
+        val questionOwnership = QuestionOwnership()
 
         /**
          * Mirrors [MeshController.transport]/[MeshController.bridge] for the
@@ -188,9 +193,33 @@ class MeshRelayJvmTest {
             }
         }
 
-        // ---- Layer 4 (mirrors MeshController.onSummaryRequest) -----------
-        override suspend fun onSummaryRequest(since: Long) {
+        // Test-observable count of cross-ack ("すれ違い") events: incremented
+        // each time onSummaryClaim sees a question now co-owned by two hubs.
+        val crossAckCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+        // ---- Layer 6 (mirrors MeshController.onSummaryClaim) -------------
+        override suspend fun onSummaryClaim(questionId: String, ownerId: String) {
+            if (!serverMode) return
+            if (ownerId == deviceId) return // our own claim echoed back
+            questionOwnership.onRemoteClaim(questionId, ownerId)
+            if (questionOwnership.isCrossAck(questionId)) crossAckCount.incrementAndGet()
+        }
+
+        // ---- Layer 4/6 (mirrors MeshController.onSummaryRequest) ----------
+        override suspend fun onSummaryRequest(since: Long, questionId: String?) {
             if (!serverMode) return // leaf never runs the model
+            val qid = questionId ?: UUID.randomUUID().toString()
+            // Per-question ownership CAS: stand down if a peer already claimed.
+            if (!questionOwnership.tryClaim(qid, deviceId)) return
+            // Claim BEFORE forwarding the request (same ordered bridge socket),
+            // so the far hub records our ownership and stands down on the
+            // forwarded request -> single answer. (Mirrors MeshController.)
+            bridge?.let { b ->
+                b.sendRaw(MessageWire.encodeSummaryClaim(qid, deviceId))
+                if (questionOwnership.shouldForward(qid)) {
+                    b.sendRaw(MessageWire.encodeSummaryReq(since, qid))
+                }
+            }
             if (!summaryInFlight.compareAndSet(false, true)) return // coalesce
             scope.launch(summaryDispatcher) {
                 summaryRunning.set(true)
@@ -210,6 +239,9 @@ class MeshRelayJvmTest {
                     )
                     put(summary)
                     relayTransport?.send(summary)
+                    // Cross to the second hub so its leaves see the summary too
+                    // (mirrors MeshController.forwardToBridge on the summary).
+                    forwardToBridge(summary, hop = 0, originId = null)
                 } finally {
                     summaryRunning.set(false)
                     summaryInFlight.set(false)
@@ -802,9 +834,14 @@ class MeshRelayJvmTest {
     // in onMessage/sendLocal), B->A by B's MeshServer.relay to its isBridge conn.
 
     /** Build the 2-hub fixture; returns a closer that tears everything down. */
-    private class TwoHubFixture {
-        val hubA = FakePeer("hubA", serverMode = true)
-        val hubB = FakePeer("hubB", serverMode = true)
+    private class TwoHubFixture(
+        engineA: SummarizationEngine? = null,
+        engineB: SummarizationEngine? = null,
+    ) {
+        // Distinct deviceIds so the layer-6 claim CAS can tell the two hubs
+        // apart (a claim from "hub-B" makes "hub-A" stand down and vice versa).
+        val hubA = FakePeer("hubA", serverMode = true, engine = engineA, deviceId = "hub-A")
+        val hubB = FakePeer("hubB", serverMode = true, engine = engineB, deviceId = "hub-B")
         lateinit var serverA: MeshServer
         lateinit var serverB: MeshServer
         lateinit var bridge: MeshClient
@@ -820,11 +857,18 @@ class MeshRelayJvmTest {
         }
     }
 
-    private fun startTwoHubs(): TwoHubFixture = TwoHubFixture().apply {
+    private fun startTwoHubs(
+        engineA: SummarizationEngine? = null,
+        engineB: SummarizationEngine? = null,
+    ): TwoHubFixture = TwoHubFixture(engineA, engineB).apply {
         serverA = startHub(hubA)
         serverB = startHub(hubB)
         hubA.localTransport = serverA
         hubB.localTransport = serverB
+        // Each hub fans its produced AI summary to its own leaves through its
+        // server (layer 4/6). Set for the summary E2E; harmless otherwise.
+        hubA.relayTransport = serverA
+        hubB.relayTransport = serverB
         // A bridges to B. A's bridge MeshClient announces itself, so B marks the
         // connection isBridge=true and forwards across it (the B->A direction).
         bridge = MeshClient(
@@ -924,7 +968,7 @@ class MeshRelayJvmTest {
                 }
                 override suspend fun onSyncRequest(since: Long, reply: suspend (String) -> Unit) {}
                 override suspend fun onLinkEstablished(transport: MeshTransport) {}
-                override suspend fun onSummaryRequest(since: Long) {}
+                override suspend fun onSummaryRequest(since: Long, questionId: String?) {}
                 override fun bridgeHopFor(messageId: String, hop: Int): Int? = null
             }
             // Re-point the bridge through a fresh client wired to the sink so we
@@ -1144,6 +1188,170 @@ class MeshRelayJvmTest {
         } finally {
             leafA?.stop(); leafB?.stop(); bridge?.stop()
             serverA.stop(); serverB.stop()
+        }
+    }
+
+    // ---- PR#6: AI single-ownership (claim CAS + dual-log on cross-ack) ------
+    //
+    // A summary_req now crosses the bridge so EITHER hub can answer; the
+    // per-question claim CAS keeps the common case to ONE answer, a simultaneous
+    // (injected) cross-ack to TWO, and a third claimant is suppressed. A single
+    // hub (no bridge) never crosses or claims, so behaviour is byte-for-byte the
+    // pre-layer-6 path. ownerId is the peer's untrusted self-report (Stage-1).
+
+    @Test
+    fun questionOwnershipFirstClaimWinsAndForeignClaimStandsDown() {
+        val own = QuestionOwnership()
+        // First claimant wins; an idempotent re-claim by the same owner is fine.
+        assertTrue(own.tryClaim("q1", "hub-A"))
+        assertTrue("idempotent self re-claim", own.tryClaim("q1", "hub-A"))
+        assertFalse("single owner: not yet cross-ack", own.isCrossAck("q1"))
+        // A different hub that has recorded A's claim stands down.
+        own.onRemoteClaim("q1", "hub-A")
+        assertFalse("foreign owner present -> stand down", own.tryClaim("q1", "hub-B"))
+    }
+
+    @Test
+    fun questionOwnershipForwardsEachQuestionAcrossTheBridgeOnlyOnce() {
+        val own = QuestionOwnership()
+        assertTrue("first offer forwards", own.shouldForward("q1"))
+        assertFalse("second offer of same id is refused", own.shouldForward("q1"))
+        assertTrue("a different id still forwards", own.shouldForward("q2"))
+    }
+
+    @Test
+    fun questionOwnershipCrossAckAdmitsTwoOwnersThenSuppressesTheThird() {
+        val own = QuestionOwnership()
+        // Cross-ack: this hub won locally, THEN a peer's claim arrives -> both
+        // own it (two-bubble outcome). isCrossAck flips true.
+        assertTrue(own.tryClaim("q1", "hub-A"))
+        own.onRemoteClaim("q1", "hub-B")
+        assertTrue("two distinct owners == cross-ack", own.isCrossAck("q1"))
+        // Runaway guard: a third distinct hub is NOT admitted (cap = 2) and
+        // cannot claim either (a foreign owner is present).
+        own.onRemoteClaim("q1", "hub-C")
+        assertFalse("third claimant cannot own", own.tryClaim("q1", "hub-C"))
+    }
+
+    @Test
+    fun twoHubsAnswerOneQuestionExactlyOnceAcrossTheBridge() = runBlocking {
+        // Modern leaf taps "状況まとめ" on A's side: a single questionId crosses
+        // to B. A claims first (claim precedes the forwarded request on the same
+        // ordered socket), so B stands down -> exactly ONE AI summary, delivered
+        // to BOTH hubs' leaves (the summary itself crosses the bridge).
+        val engA = FakeSummarizationEngine()
+        val engB = FakeSummarizationEngine()
+        val f = startTwoHubs(engineA = engA, engineB = engB)
+        try {
+            f.hubA.put(msg("c-1", "water needed", "leafA", 1_000, MessageStatus.SENT))
+            // A leaf frames a summary_req with a freshly-minted questionId.
+            assertTrue(f.leafA!!.sendRaw(MessageWire.encodeSummaryReq(questionId = "Q-shared")))
+            await("an AI summary reached A's leaf") {
+                f.leafAPeer.store.values.any { it.senderId == AI_SENDER_ID }
+            }
+            await("the AI summary crossed to B's leaf") {
+                f.leafBPeer.store.values.any { it.senderId == AI_SENDER_ID }
+            }
+            // Let any erroneous second generation settle, then assert single answer.
+            Thread.sleep(400)
+            assertEquals("exactly one hub generated", 1, engA.callCount.get() + engB.callCount.get())
+            assertEquals("B stood down on A's claim", 0, engB.callCount.get())
+            assertEquals(1, f.leafAPeer.store.values.count { it.senderId == AI_SENDER_ID })
+            assertEquals(1, f.leafBPeer.store.values.count { it.senderId == AI_SENDER_ID })
+        } finally {
+            f.close()
+        }
+    }
+
+    @Test
+    fun crossAckInjectionMakesBothHubsAnswerWithTwoAiBubblesAndDualLog() = runBlocking {
+        // Genuine "すれ違い": each hub independently originates the SAME
+        // questionId and wins its local claim BEFORE the peer's claim lands; the
+        // two claims then cross in flight. To inject that crossing deterministic-
+        // ally (the spec's "claim をすれ違わせる") we run each hub WITHOUT a bridge
+        // (so its auto-claim cannot pre-empt the other) and then hand each hub
+        // the peer's claim AFTER both have started. Both continue -> two answers,
+        // and each hub logs the cross-ack exactly once. A leaf renders the two
+        // AI messages (distinct ids) as two bubbles via the existing UI.
+        val engA = FakeSummarizationEngine()
+        val engB = FakeSummarizationEngine()
+        // Bridge left null: each hub only claims locally (no cross-talk yet).
+        val hubA = FakePeer("hubA", serverMode = true, engine = engA, deviceId = "hub-A")
+        val hubB = FakePeer("hubB", serverMode = true, engine = engB, deviceId = "hub-B")
+        hubA.put(msg("c-a", "from A side", "leafA", 1_000, MessageStatus.SENT))
+        hubB.put(msg("c-b", "from B side", "leafB", 1_000, MessageStatus.SENT))
+        // Simultaneous origination: each wins its own CAS and starts generating.
+        hubA.onSummaryRequest(0L, "Q-cross")
+        hubB.onSummaryRequest(0L, "Q-cross")
+        await("both hubs generated (two answers)") {
+            engA.callCount.get() == 1 && engB.callCount.get() == 1
+        }
+        // The crossed claims now arrive (each hub hears the OTHER's claim).
+        hubA.onSummaryClaim("Q-cross", "hub-B")
+        hubB.onSummaryClaim("Q-cross", "hub-A")
+        // Dual-log: each hub recorded the cross-ack exactly once; neither retracts.
+        await("A logged cross-ack") { hubA.crossAckCount.get() == 1 }
+        await("B logged cross-ack") { hubB.crossAckCount.get() == 1 }
+        assertTrue("A still co-owns after cross-ack", hubA.questionOwnership.isCrossAck("Q-cross"))
+        assertTrue("B still co-owns after cross-ack", hubB.questionOwnership.isCrossAck("Q-cross"))
+        // Two distinct AI summaries exist (one per hub) -> two bubbles for a leaf.
+        await("each hub produced its own AI summary") {
+            hubA.store.values.count { it.senderId == AI_SENDER_ID } == 1 &&
+                hubB.store.values.count { it.senderId == AI_SENDER_ID } == 1
+        }
+        val idA = hubA.store.values.first { it.senderId == AI_SENDER_ID }.id
+        val idB = hubB.store.values.first { it.senderId == AI_SENDER_ID }.id
+        assertTrue("the two summaries are distinct messages", idA != idB)
+    }
+
+    @Test
+    fun thirdConcurrentClaimantIsSuppressedToAtMostTwoAnswers() {
+        // Three hubs claim the SAME question almost at once. The first two are
+        // admitted (cross-ack, two answers); the third is suppressed by the cap,
+        // so a question never produces a third runaway answer.
+        val own = QuestionOwnership()
+        assertTrue("hub A wins its local claim", own.tryClaim("q", "hub-A"))
+        own.onRemoteClaim("q", "hub-B") // B's claim crosses in -> co-owner
+        assertTrue("now two owners (A,B)", own.isCrossAck("q"))
+        // A third hub: neither a recorded remote claim nor a local claim admits it.
+        own.onRemoteClaim("q", "hub-C")
+        assertFalse(own.tryClaim("q", "hub-C"))
+    }
+
+    @Test
+    fun singleHubNeverClaimsOrCrossesSoBehaviourIsUnchanged() = runBlocking {
+        // Zero-regression: with NO bridge, a hub answers a summary_req exactly
+        // once and emits no claim/forward (there is nowhere to send them). This
+        // is the pre-layer-6 single-star path, byte-for-byte.
+        val fake = FakeSummarizationEngine()
+        val hub = FakePeer("hub", serverMode = true, engine = fake, deviceId = "hub-solo")
+        val server = startHub(hub)
+        hub.relayTransport = server
+        // A raw socket that would observe ANY claim/forward if one were emitted.
+        var bridge: FakeBridge? = null
+        var client: MeshClient? = null
+        try {
+            val port = server.boundPort
+            bridge = FakeBridge(port)
+            bridge.announce("observer")
+            client = MeshClient("127.0.0.1", port, FakePeer("A"))
+            client.start()
+            await("2 peers") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 2
+            }
+            hub.put(msg("c-1", "status ok", "A", 1_000, MessageStatus.SENT))
+            // NOTE: hub.bridge stays null (single hub) -> no forward, no claim.
+            assertTrue(client.sendRaw(MessageWire.encodeSummaryReq(questionId = "Q-solo")))
+            await("hub generated exactly one AI summary") {
+                hub.store.values.count { it.senderId == AI_SENDER_ID } == 1
+            }
+            Thread.sleep(300)
+            assertEquals("single answer", 1, fake.callCount.get())
+            // The observer never received a forwarded summary_req (only the AI
+            // summary msg fan-out, which is a normal msg, is allowed to arrive).
+            assertEquals("no claim/forward emitted on a single hub", 0, hub.crossAckCount.get())
+        } finally {
+            client?.stop(); bridge?.close(); server.stop()
         }
     }
 }

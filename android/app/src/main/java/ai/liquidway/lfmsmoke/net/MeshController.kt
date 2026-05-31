@@ -61,6 +61,16 @@ class MeshController private constructor(
     private val summaryInFlight = AtomicBoolean(false)
 
     /**
+     * Layer-6 per-question ownership: lets a `summary_req` cross the bridge so
+     * EITHER hub can answer, while the claim CAS keeps the common case to a
+     * single answer (and a simultaneous cross-ack to at most two). Pure logic,
+     * no Room/Context dependency, so it is unit-tested directly. Idle on a
+     * single hub (bridge==null): the request never crosses and only the local
+     * hub claims, so the behaviour is byte-for-byte the pre-layer-6 path.
+     */
+    val questionOwnership = QuestionOwnership()
+
+    /**
      * Injected by the host (the service) before any summary_req can arrive.
      * Null on a pure leaf or before injection — a summary_req is then ignored.
      * Kept as a lambda so the heavyweight LEAP engine is constructed lazily and
@@ -351,11 +361,42 @@ class MeshController private constructor(
      * is never blocked. [summaryInFlight] coalesces duplicate requests so a
      * room full of devices tapping the button does not queue N generations.
      */
-    override suspend fun onSummaryRequest(since: Long) {
+    override suspend fun onSummaryRequest(since: Long, questionId: String?) {
         if (!serverMode) {
             Log.d(TAG, "Ignoring summary_req: not the hub")
             return
         }
+        // Resolve the correlation id. A modern leaf stamps one; a legacy leaf
+        // sends none, so the FIRST receiving hub mints a fallback. NOTE: with a
+        // legacy (id-less) leaf in the mix the two hubs mint *different* ids for
+        // the same tap and cannot recognise it as one question -> a double
+        // answer can occur. Known Stage-1 limitation (modern leaves are fine).
+        val qid = questionId ?: UUID.randomUUID().toString()
+
+        // Per-question ownership CAS. If a peer hub's claim already arrived we
+        // stand down here (the single-owner common case). On a single hub this
+        // always wins (no peer can have claimed), so behaviour is unchanged.
+        if (!questionOwnership.tryClaim(qid, selfId())) {
+            Log.i(TAG, "summary_req $qid already owned by a peer; standing down")
+            return
+        }
+        // We own this question. Announce the claim across the bridge BEFORE we
+        // forward the request, so the far hub records our ownership and stands
+        // down when it then reads the forwarded request (claim + request travel
+        // the same ordered bridge socket, so claim-first guarantees the far hub
+        // sees it first). A genuinely simultaneous claim (both hubs originate
+        // before either's claim lands) crosses in flight -> both answer
+        // (two-bubble cross-ack), handled in [onSummaryClaim].
+        bridge?.let { b ->
+            b.sendRaw(MessageWire.encodeSummaryClaim(qid, selfId()))
+            // Fan the request across the bridge (once per question) so the second
+            // hub can also answer if WE later fail. No-op on a single hub
+            // (bridge==null). The forward-once guard stops a ping-pong.
+            if (questionOwnership.shouldForward(qid)) {
+                b.sendRaw(MessageWire.encodeSummaryReq(since, qid))
+            }
+        }
+
         if (!summaryInFlight.compareAndSet(false, true)) {
             Log.i(TAG, "Summary already in flight; coalescing request")
             return
@@ -413,16 +454,46 @@ class MeshController private constructor(
      *   "サーバー未接続"); the model is never run leaf-side.
      */
     suspend fun requestSummary(): Boolean {
+        // Mint the correlation id at the request source so BOTH hubs see ONE
+        // question id and per-request ownership can dedup the answer to one.
+        val questionId = UUID.randomUUID().toString()
         if (serverMode) {
-            onSummaryRequest(0L)
+            onSummaryRequest(0L, questionId)
             return true
         }
         val t = transport ?: run {
             Log.i(TAG, "requestSummary: no transport (server not connected)")
             return false
         }
-        return t.sendRaw(MessageWire.encodeSummaryReq())
+        return t.sendRaw(MessageWire.encodeSummaryReq(questionId = questionId))
     }
+
+    /**
+     * Stage-1 bridge: a peer hub claimed [questionId]. Record it so our own
+     * pending generation for that question stands down (single-owner case). If
+     * we had already won and started, the claims crossed in flight ("すれ違い"):
+     * both hubs answer (two AI bubbles) and we log the dual-option outcome. We
+     * never cancel a generation already begun. Leaf/non-hub ignores it.
+     */
+    override suspend fun onSummaryClaim(questionId: String, ownerId: String) {
+        if (!serverMode) return
+        if (ownerId == selfId()) return // our own claim echoed back; ignore
+        questionOwnership.onRemoteClaim(questionId, ownerId)
+        if (questionOwnership.isCrossAck(questionId)) {
+            Log.i(TAG, "Cross-ack on $questionId (claim from $ownerId): both hubs answer, 2 options")
+        } else {
+            Log.i(TAG, "Peer $ownerId claimed $questionId; this hub stands down")
+        }
+    }
+
+    // This hub's stable id, cached so the claim path need not suspend on every
+    // request. Falls back to "hub" before the first resolution (rare; the id is
+    // resolved on configure of a bridged hub).
+    @Volatile
+    private var cachedSelfId: String? = null
+
+    private suspend fun selfId(): String =
+        cachedSelfId ?: settings.deviceId().also { cachedSelfId = it }
 
     private fun resolveEngine(): SummarizationEngine? {
         resolvedEngine?.let { return it }
@@ -641,6 +712,119 @@ class BridgePolicy(private val capacity: Int = DEFAULT_CAPACITY) {
          * re-forwarded, but only long after any in-flight echo could still be
          * circulating, so it is harmless for loop control.
          */
+        const val DEFAULT_CAPACITY = 2048
+    }
+}
+
+/**
+ * Stage-1 bridge: per-question single-ownership of an AI summary (layer 6).
+ *
+ * A `summary_req` carries a `questionId`; with the request now crossing the
+ * bridge so EITHER hub can answer, two hubs could both generate. This registry
+ * gives a leaderless, per-request owner so that — in the common case — exactly
+ * one hub answers a given question:
+ *
+ *  1. **Forward-once** ([shouldForward]) — a hub forwards a given questionId
+ *     across the bridge at most once, so a `summary_req` does not ping-pong.
+ *  2. **Claim CAS** ([tryClaim]) — a hub may generate for a questionId only if
+ *     no *foreign* owner has already been recorded for it. The first hub to
+ *     claim wins; a hub that has already seen a peer's claim stands down.
+ *  3. **Cross-ack ("すれ違い")** — when two hubs claim almost simultaneously
+ *     their claims cross in flight: each had already locally won [tryClaim]
+ *     before the other's claim arrived. [onRemoteClaim] then records the peer
+ *     as a co-owner (it does NOT retract a generation already in flight), so
+ *     BOTH answer and the leaf shows two AI bubbles — the deliberate
+ *     "two-options" outcome. [isCrossAck] reports this so the caller can log it.
+ *  4. **Runaway guard** — at most [maxOwners] distinct owners are ever recorded
+ *     per question, so a third (or later) hub is suppressed: it can neither
+ *     [tryClaim] (a foreign owner is present) nor be admitted by [onRemoteClaim]
+ *     once the cap is reached.
+ *
+ * SECURITY NOTE: `ownerId` is the peer's *self-report* and is not authenticated.
+ * A malicious peer could claim every questionId to suppress real answers (a DoS)
+ * or spoof an ownerId. Stage-1 assumes a same-LAN, operator-configured host, so
+ * this is accepted; ownership/identity verification is future work (Task #21).
+ *
+ * Thread-safety: like [BridgePolicy], every method is [Synchronized] — the hub's
+ * reader coroutines (and the bridge client's reader) call in concurrently, and
+ * each operation is a short read-modify-write over the non-thread-safe maps.
+ */
+class QuestionOwnership(
+    private val maxOwners: Int = DEFAULT_MAX_OWNERS,
+    private val capacity: Int = DEFAULT_CAPACITY,
+) {
+    // questionId -> ordered set of ownerIds that have claimed it (capped at
+    // maxOwners). LinkedHashSet preserves "first claim wins" ordering for logs.
+    private val owners = boundedMap<MutableSet<String>>()
+
+    // questionIds already forwarded across the bridge (forward-once guard).
+    private val forwarded = boundedMap<Boolean>()
+
+    /** True the FIRST time this questionId is offered for cross-bridge forward. */
+    @Synchronized
+    fun shouldForward(questionId: String): Boolean {
+        if (forwarded.containsKey(questionId)) return false
+        forwarded[questionId] = true
+        return true
+    }
+
+    /**
+     * Attempt to own [questionId] as [ownerId]. Succeeds (recording the owner)
+     * only when no FOREIGN owner is yet present — i.e. the question is unclaimed
+     * or already claimed by this same owner (idempotent re-entry). A hub that has
+     * already recorded a peer's claim therefore stands down (returns false).
+     *
+     * @return true if this owner may proceed to generate.
+     */
+    @Synchronized
+    fun tryClaim(questionId: String, ownerId: String): Boolean {
+        val set = owners[questionId]
+        if (set == null) {
+            owners[questionId] = linkedSetOf(ownerId)
+            return true
+        }
+        if (set.contains(ownerId)) return true // idempotent: already mine
+        // A foreign owner is present -> stand down (normal single-owner case).
+        return false
+    }
+
+    /**
+     * Record a peer's [ownerId] claim for [questionId]. Used purely to make a
+     * later local [tryClaim] stand down (normal case) and to admit a co-owner up
+     * to the [maxOwners] cap (cross-ack case). Never cancels work already begun.
+     */
+    @Synchronized
+    fun onRemoteClaim(questionId: String, ownerId: String) {
+        val set = owners.getOrPut(questionId) { linkedSetOf() }
+        if (set.contains(ownerId)) return
+        if (set.size >= maxOwners) return // runaway guard: cap distinct owners
+        set.add(ownerId)
+    }
+
+    /**
+     * True when [questionId] now has more than one distinct owner — the
+     * cross-ack ("すれ違い") outcome where both hubs answer. Caller uses it only
+     * to emit the dual-answer log line.
+     */
+    @Synchronized
+    fun isCrossAck(questionId: String): Boolean =
+        (owners[questionId]?.size ?: 0) > 1
+
+    private fun <V> boundedMap(): LinkedHashMap<String, V> =
+        object : LinkedHashMap<String, V>(16, 0.75f, false) {
+            override fun removeEldestEntry(eldest: Map.Entry<String, V>): Boolean =
+                size > capacity
+        }
+
+    companion object {
+        /**
+         * Distinct owners allowed per question. Two is the deliberate ceiling:
+         * a clean single owner in the common case, at most a two-bubble
+         * cross-ack on a simultaneous claim, never a third runaway answer.
+         */
+        const val DEFAULT_MAX_OWNERS = 2
+
+        /** Bounds memory to this many recently-seen questionIds (FIFO eviction). */
         const val DEFAULT_CAPACITY = 2048
     }
 }
