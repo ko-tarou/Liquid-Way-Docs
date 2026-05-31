@@ -125,7 +125,12 @@ class MeshClient(
                             // hub does not relay summary_req, so a leaf should
                             // not see this — ignore defensively.
                             Log.d(TAG, "Ignoring summary_req on leaf")
-                        MessageWire.Frame.Unknown -> Unit // skip; keep the link
+                        // Stage-1 bridge frames + Unknown: no relay path consumes
+                        // them yet, so skip without dropping the link.
+                        is MessageWire.Frame.BridgeHello,
+                        is MessageWire.Frame.SummaryClaim,
+                        MessageWire.Frame.Unknown,
+                        -> Unit
                     }
                 }
             } catch (e: Exception) {
