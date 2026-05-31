@@ -8,6 +8,7 @@ import ai.liquidway.lfmsmoke.data.MessageStatus
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -17,8 +18,13 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -81,6 +87,10 @@ class MeshRelayJvmTest {
         var relayTransport: MeshTransport? = null,
     ) : MeshEvents {
         val store = ConcurrentHashMap<String, Message>()
+        // Mirrors MeshController.bridgePolicy: the hub forwards across a bridge
+        // through this real policy (seen-set + hop ceiling), so the loop and
+        // ceiling guards exercised here are the production logic.
+        val bridgePolicy = BridgePolicy()
         private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private val summaryDispatcher = Dispatchers.IO.limitedParallelism(1)
         private val summaryInFlight = AtomicBoolean(false)
@@ -98,6 +108,9 @@ class MeshRelayJvmTest {
         }
 
         override suspend fun onMessage(message: Message): Boolean = put(message)
+
+        override fun bridgeHopFor(messageId: String, hop: Int): Int? =
+            bridgePolicy.bridgeHopFor(messageId, hop)
 
         override suspend fun onSyncRequest(since: Long, reply: suspend (String) -> Unit) {
             store.values
@@ -538,5 +551,191 @@ class MeshRelayJvmTest {
         // A genuinely unknown future type is the skip-not-drop contract.
         val future = """{"type":"totally_new","x":1}"""
         assertTrue(MessageWire.decodeFrame(future) is MessageWire.Frame.Unknown)
+    }
+
+    // ---- Stage-1 bridge: relay routing (isBridge + forwarding policy) -----
+    //
+    // The real bridge transport (a hub→hub MeshClient) is wired in PR#4, so a
+    // raw loopback socket stands in for the "other hub": it connects, sends a
+    // bridge_hello so the hub flips its connection to isBridge=true, and then
+    // captures the exact frames the hub forwards (so hop/originId can be
+    // asserted on the wire). hop/originId are the sender's self-report and are
+    // not authenticated here; loop safety is the BridgePolicy seen-set + ceiling.
+
+    /** A raw socket masquerading as a peer hub across a bridge link. */
+    private class FakeBridge(port: Int) {
+        private val socket = Socket().apply {
+            tcpNoDelay = true
+            connect(InetSocketAddress("127.0.0.1", port), 5_000)
+        }
+        private val out = socket.getOutputStream()
+        private val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+        val received = CopyOnWriteArrayList<MessageWire.Frame.Msg>()
+        private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        init {
+            scope.launch {
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    (MessageWire.decodeFrame(line) as? MessageWire.Frame.Msg)?.let { received.add(it) }
+                }
+            }
+        }
+
+        /** Announce as a hub so the server marks this connection isBridge=true. */
+        fun announce(deviceId: String) {
+            out.write(MessageWire.encodeBridgeHello(deviceId).toByteArray(Charsets.UTF_8))
+            out.flush()
+        }
+
+        /** Inject a chat msg into the hub as if forwarded across the bridge. */
+        fun sendMsg(line: String) {
+            out.write(line.toByteArray(Charsets.UTF_8))
+            out.flush()
+        }
+
+        fun close() {
+            scope.cancel()
+            runCatching { socket.close() }
+        }
+    }
+
+    @Test
+    fun leafMessageIsForwardedToBridgeWithIncrementedHopAndStampedOrigin() = runBlocking {
+        val hub = FakePeer("hub")
+        val server = startHub(hub)
+        var leaf: MeshClient? = null
+        var bridge: FakeBridge? = null
+        try {
+            val port = server.boundPort
+            bridge = FakeBridge(port)
+            bridge.announce("hub-B")
+            leaf = MeshClient("127.0.0.1", port, FakePeer("leaf"))
+            leaf.start()
+            await("2 peers") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 2
+            }
+            // A leaf-authored msg (hop 0, no origin) must cross the bridge once.
+            assertTrue(leaf.send(msg("b-1", "to bridge", "device-A")))
+            await("bridge got forwarded msg") { bridge!!.received.any { it.message.id == "b-1" } }
+            val f = bridge.received.first { it.message.id == "b-1" }
+            assertEquals("hop incremented 0 -> 1", 1, f.hop)
+            assertEquals("origin stamped to sender", "device-A", f.originId)
+        } finally {
+            leaf?.stop(); bridge?.close(); server.stop()
+        }
+    }
+
+    @Test
+    fun bridgeMessageFansOutToLeavesButNeverBackToTheBridge() = runBlocking {
+        val hub = FakePeer("hub")
+        val leafPeer = FakePeer("leaf")
+        val server = startHub(hub)
+        var leaf: MeshClient? = null
+        var bridge: FakeBridge? = null
+        try {
+            val port = server.boundPort
+            leaf = MeshClient("127.0.0.1", port, leafPeer)
+            leaf.start()
+            bridge = FakeBridge(port)
+            bridge.announce("hub-B")
+            await("2 peers") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 2
+            }
+            // A msg arriving FROM the bridge: leaves see it, the bridge does not.
+            bridge.sendMsg(MessageWire.encode(msg("b-2", "from bridge", "device-Z"), hop = 1, originId = "device-Z"))
+            await("leaf got bridged msg") { leafPeer.store.containsKey("b-2") }
+            // Give the hub ample time to (wrongly) echo before asserting absence.
+            Thread.sleep(200)
+            assertTrue("must not echo to source bridge", bridge.received.none { it.message.id == "b-2" })
+        } finally {
+            leaf?.stop(); bridge?.close(); server.stop()
+        }
+    }
+
+    @Test
+    fun sameMessageIsNotForwardedToTheBridgeTwice() = runBlocking {
+        val hub = FakePeer("hub")
+        val server = startHub(hub)
+        var leaf: MeshClient? = null
+        var bridge: FakeBridge? = null
+        try {
+            val port = server.boundPort
+            bridge = FakeBridge(port)
+            bridge.announce("hub-B")
+            leaf = MeshClient("127.0.0.1", port, FakePeer("leaf"))
+            leaf.start()
+            await("2 peers") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 2
+            }
+            // Same id sent twice: the seen-set forwards the first, refuses the 2nd.
+            assertTrue(leaf.send(msg("dup-1", "first", "device-A")))
+            await("bridge got it once") { bridge!!.received.any { it.message.id == "dup-1" } }
+            assertTrue(leaf.send(msg("dup-1", "second", "device-A")))
+            Thread.sleep(200)
+            assertEquals("forwarded across bridge exactly once", 1, bridge.received.count { it.message.id == "dup-1" })
+        } finally {
+            leaf?.stop(); bridge?.close(); server.stop()
+        }
+    }
+
+    @Test
+    fun messageAtMaxHopIsNotForwardedToTheBridge() = runBlocking {
+        val hub = FakePeer("hub")
+        val leafPeer = FakePeer("leaf")
+        val server = startHub(hub)
+        var leaf: MeshClient? = null
+        var bridge: FakeBridge? = null
+        try {
+            val port = server.boundPort
+            leaf = MeshClient("127.0.0.1", port, leafPeer)
+            leaf.start()
+            bridge = FakeBridge(port)
+            bridge.announce("hub-B")
+            await("2 peers") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 2
+            }
+            // hop == MAX_HOP from the leaf: the ceiling guard blocks the bridge
+            // forward (leaf fan-out is unaffected — this leaf is the sender, so
+            // there is no other leaf to observe; the assertion is bridge-absence).
+            assertTrue(leaf.sendRaw(MessageWire.encode(msg("hop-max", "capped", "device-A"), hop = BridgePolicy.MAX_HOP)))
+            // It still reaches the hub store (relay does not gate the leaf path).
+            await("hub stored it") { hub.store.containsKey("hop-max") }
+            Thread.sleep(200)
+            assertTrue("ceiling blocks bridge forward", bridge.received.none { it.message.id == "hop-max" })
+        } finally {
+            leaf?.stop(); bridge?.close(); server.stop()
+        }
+    }
+
+    @Test
+    fun plainLeafToLeafRelayIsUnchangedWhenABridgeIsPresent() = runBlocking {
+        // Regression guard: a bridge connection must not alter the star's
+        // leaf↔leaf fan-out (no hop rewrite, delivered to every other leaf).
+        val hub = FakePeer("hub")
+        val bPeer = FakePeer("B")
+        val server = startHub(hub)
+        var clientA: MeshClient? = null
+        var clientB: MeshClient? = null
+        var bridge: FakeBridge? = null
+        try {
+            val port = server.boundPort
+            clientA = MeshClient("127.0.0.1", port, FakePeer("A"))
+            clientB = MeshClient("127.0.0.1", port, bPeer)
+            clientA.start(); clientB.start()
+            bridge = FakeBridge(port)
+            bridge.announce("hub-B")
+            await("3 peers") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 3
+            }
+            assertTrue(clientA.send(msg("leaf-1", "hello B", "device-A")))
+            await("B received via plain fan-out") { bPeer.store.containsKey("leaf-1") }
+            // Delivered as an ordinary msg (hop stays 0; the leaf path never
+            // rewrites the envelope), exactly as before the bridge existed.
+            assertEquals("hello B", bPeer.store["leaf-1"]!!.body)
+            assertEquals(MessageStatus.SENT, bPeer.store["leaf-1"]!!.status)
+        } finally {
+            clientA?.stop(); clientB?.stop(); bridge?.close(); server.stop()
+        }
     }
 }

@@ -94,6 +94,11 @@ class MeshRelayTest {
         // summarisation (covered deterministically in MeshRelayJvmTest), so a
         // no-op satisfies the interface without changing this test's scope.
         override suspend fun onSummaryRequest(since: Long) = Unit
+
+        // Stage-1 bridge: this leaf-only test has no bridge connections, so the
+        // hop policy is never consulted; a never-forward stub satisfies the
+        // interface without changing this test's scope.
+        override fun bridgeHopFor(messageId: String, hop: Int): Int? = null
     }
 
     @Test

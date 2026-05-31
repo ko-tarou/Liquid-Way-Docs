@@ -286,10 +286,22 @@ class MeshController private constructor(
      * Context dependency and can be unit-tested directly. PR#3's relay will ask
      * [BridgePolicy.bridgeHopFor] before forwarding a message across a bridge.
      *
-     * Not consulted by any relay path in this PR: the star topology is
-     * unchanged. This is dead-code-until-wired, validated only by unit tests.
+     * PR#3 wires this into the hub's relay via [bridgeHopFor]: a chat message
+     * is only forwarded onto a *bridge* connection when the policy allows it.
+     * Leaf fan-out never consults it, so the star topology is unchanged. No
+     * bridge connection is created until PR#4 wires the inter-hub transport, so
+     * in this PR the bridge branch is exercised only by tests.
      */
     val bridgePolicy = BridgePolicy()
+
+    /**
+     * Stage-1 bridge forwarding decision, delegated to [bridgePolicy]. Called
+     * by the hub's reader (on Dispatchers.IO, possibly concurrently across
+     * client readers); [BridgePolicy.bridgeHopFor] is @Synchronized so the
+     * read-modify-write of its seen-set is safe.
+     */
+    override fun bridgeHopFor(messageId: String, hop: Int): Int? =
+        bridgePolicy.bridgeHopFor(messageId, hop)
 
     // ---- Outbox ----------------------------------------------------------
 

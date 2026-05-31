@@ -47,4 +47,18 @@ interface MeshEvents {
      * @param since advisory high-water mark (0 = "recent window, hub decides").
      */
     suspend fun onSummaryRequest(since: Long)
+
+    /**
+     * Stage-1 bridge: decide whether a message may be forwarded across an
+     * inter-hub bridge, and at what hop. The hub's reader calls this before
+     * relaying a chat message onto a *bridge* connection (never onto a plain
+     * leaf — leaf fan-out stays policy-free and unchanged).
+     *
+     * Delegates to [MeshController]'s loop-prevention policy (seen-set + hop
+     * ceiling). Pure, non-suspending decision so a reader can call it inline.
+     *
+     * @return the hop to stamp on the forwarded frame ([hop] + 1), or null to
+     *   NOT forward (already-seen loop break, or hop ceiling reached).
+     */
+    fun bridgeHopFor(messageId: String, hop: Int): Int?
 }
