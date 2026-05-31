@@ -25,8 +25,17 @@ sealed interface MeshState {
      * Modelled as a nullable [Boolean] (not an enum) because "absent" must be a
      * distinct, default-producing state from "present-but-down"; a tri-state
      * Boolean? captures exactly that with no extra type.
+     *
+     * [operatorLabel] is the operator-layer-2 readout ("自分" / "peer:xxxx"), set
+     * ONLY when a bridge is in play (alongside [bridge]). Null on every
+     * non-bridge deployment so [describe] renders the byte-for-byte pre-operator
+     * string — purely informational, it changes no behaviour.
      */
-    data class Hub(val peerCount: Int, val bridge: Boolean? = null) : MeshState
+    data class Hub(
+        val peerCount: Int,
+        val bridge: Boolean? = null,
+        val operatorLabel: String? = null,
+    ) : MeshState
 
     /** Acting as a leaf node, trying to reach [host]:[port]. */
     data class Connecting(val host: String, val port: Int) : MeshState

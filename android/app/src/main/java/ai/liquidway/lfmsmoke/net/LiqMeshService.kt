@@ -186,7 +186,7 @@ private fun MeshState.describe(): String = when (this) {
         null -> ""
         true -> " · ブリッジ: 接続"
         false -> " · ブリッジ: 切断（再接続中）"
-    }
+    } + operatorLabel?.let { " · オペレーター: $it" }.orEmpty()
     is MeshState.Connecting -> "Connecting to $host…"
     is MeshState.Connected -> "Connected to $host"
     is MeshState.Disconnected -> "Disconnected · $reason"
