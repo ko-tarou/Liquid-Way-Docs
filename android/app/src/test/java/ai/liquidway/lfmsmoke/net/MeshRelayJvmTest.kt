@@ -469,4 +469,74 @@ class MeshRelayJvmTest {
                 !is MessageWire.Frame.Unknown,
         )
     }
+
+    // ---- Stage-1 bridge wire (dead-data: type/encode/decode only) --------
+
+    @Test
+    fun msgEnvelopePreservesHopAndOriginIdRoundTrip() {
+        val line = MessageWire.encode(msg("e1", "bridged"), hop = 2, originId = "device-Z")
+        val f = MessageWire.decodeFrame(line) as MessageWire.Frame.Msg
+        assertEquals("e1", f.message.id)
+        assertEquals(2, f.hop)
+        assertEquals("device-Z", f.originId)
+    }
+
+    @Test
+    fun legacyMsgWithoutEnvelopeDecodesToHopZeroAndNullOrigin() {
+        // A new-style msg that simply omits the optional bridge fields.
+        val noEnvelope =
+            """{"type":"msg","id":"n1","senderId":"d","senderName":"n","body":"b","createdAt":5}"""
+        val f = MessageWire.decodeFrame(noEnvelope) as MessageWire.Frame.Msg
+        assertEquals(0, f.hop)
+        assertNull(f.originId)
+        // The oldest layer-2 shape (no type field at all) still decodes too.
+        val legacy = """{"id":"L1","senderId":"d","senderName":"n","body":"b","createdAt":1}"""
+        val lf = MessageWire.decodeFrame(legacy) as MessageWire.Frame.Msg
+        assertEquals("L1", lf.message.id)
+        assertEquals(0, lf.hop)
+        assertNull(lf.originId)
+    }
+
+    @Test
+    fun bridgeHelloRoundTrips() {
+        val f = MessageWire.decodeFrame(MessageWire.encodeBridgeHello("hub-7"))
+        assertTrue(f is MessageWire.Frame.BridgeHello)
+        assertEquals("hub-7", (f as MessageWire.Frame.BridgeHello).deviceId)
+    }
+
+    @Test
+    fun summaryClaimRoundTrips() {
+        val f = MessageWire.decodeFrame(MessageWire.encodeSummaryClaim("q-1", "owner-A"))
+        assertTrue(f is MessageWire.Frame.SummaryClaim)
+        val claim = f as MessageWire.Frame.SummaryClaim
+        assertEquals("q-1", claim.questionId)
+        assertEquals("owner-A", claim.ownerId)
+    }
+
+    @Test
+    fun summaryReqQuestionIdRoundTripsAndDefaultsNull() {
+        val withId = MessageWire.decodeFrame(MessageWire.encodeSummaryReq(0L, "q-42"))
+                as MessageWire.Frame.SummaryReq
+        assertEquals("q-42", withId.questionId)
+        val without = MessageWire.decodeFrame(MessageWire.encodeSummaryReq())
+                as MessageWire.Frame.SummaryReq
+        assertNull(without.questionId)
+    }
+
+    @Test
+    fun newBridgeFramesAreUnknownSafeAndDoNotDropTheLink() {
+        // A pre-bridge peer never throws on the new types; if it lacked the
+        // branches it would simply see Unknown and skip (link stays up).
+        assertTrue(
+            MessageWire.decodeFrame(MessageWire.encodeBridgeHello("x"))
+                !is MessageWire.Frame.Unknown,
+        )
+        assertTrue(
+            MessageWire.decodeFrame(MessageWire.encodeSummaryClaim("q", "o"))
+                !is MessageWire.Frame.Unknown,
+        )
+        // A genuinely unknown future type is the skip-not-drop contract.
+        val future = """{"type":"totally_new","x":1}"""
+        assertTrue(MessageWire.decodeFrame(future) is MessageWire.Frame.Unknown)
+    }
 }

@@ -153,7 +153,12 @@ class MeshServer(
                             // plain chat while a summary is produced.
                             events.onSummaryRequest(f.since)
                         }
-                        MessageWire.Frame.Unknown -> Unit // skip; keep the link
+                        // Stage-1 bridge frames + Unknown: no relay path consumes
+                        // them yet, so skip without dropping the link.
+                        is MessageWire.Frame.BridgeHello,
+                        is MessageWire.Frame.SummaryClaim,
+                        MessageWire.Frame.Unknown,
+                        -> Unit
                     }
                 }
             } catch (e: Exception) {

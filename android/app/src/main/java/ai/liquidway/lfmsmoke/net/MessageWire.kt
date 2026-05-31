@@ -53,6 +53,18 @@ object MessageWire {
     const val TYPE_SUMMARY_REQ = "summary_req"
 
     /**
+     * Stage-1 bridge frames. They are wire-level type/encode/decode only: no
+     * relay path consumes them yet (dead-data until the 2-hub bridge lands).
+     *
+     *  - [TYPE_BRIDGE_HELLO]   : a hub announces itself across a bridge link
+     *                            (future hub identification / liveness).
+     *  - [TYPE_SUMMARY_CLAIM]  : ownership assertion so exactly one hub answers a
+     *                            given summary question ("first to receive wins").
+     */
+    const val TYPE_BRIDGE_HELLO = "bridge_hello"
+    const val TYPE_SUMMARY_CLAIM = "summary_claim"
+
+    /**
      * Reserved sender id for AI-authored summary messages (re-exported from the
      * data package so wire-layer callers need not reach across packages). A
      * message with this sender renders as a system/AI bubble and is excluded
@@ -65,8 +77,20 @@ object MessageWire {
 
     /** A decoded inbound frame. */
     sealed interface Frame {
-        /** A chat message (plain layer-2 payload or a sync_resp replay). */
-        data class Msg(val message: Message) : Frame
+        /**
+         * A chat message (plain layer-2 payload or a sync_resp replay).
+         *
+         * [hop] and [originId] are Stage-1 bridge envelope fields: [hop] is the
+         * number of bridge crossings (0 at the originating device) and
+         * [originId] is the deviceId that first injected the message. They are
+         * dead-data today — no relay path reads them — and default so layer-2/3
+         * call sites (and legacy peers) keep working unchanged.
+         */
+        data class Msg(
+            val message: Message,
+            val hop: Int = 0,
+            val originId: String? = null,
+        ) : Frame
 
         /** A backfill request: replay everything created after [since] (epoch ms). */
         data class SyncReq(val since: Long) : Frame
@@ -76,8 +100,23 @@ object MessageWire {
          * (kept 0 today); the hub caps the window by count itself. Modelled as
          * a frame, not a [Message], because it triggers work rather than
          * carrying content.
+         *
+         * [questionId] is a Stage-1 bridge field (null today) that will let a
+         * [SummaryClaim] reference the specific request being answered.
          */
-        data class SummaryReq(val since: Long) : Frame
+        data class SummaryReq(val since: Long, val questionId: String? = null) : Frame
+
+        /**
+         * Stage-1 bridge: a hub's self-announcement across a bridge link.
+         * Decode/encode only — not yet wired into any transport path.
+         */
+        data class BridgeHello(val deviceId: String) : Frame
+
+        /**
+         * Stage-1 bridge: ownership claim for answering [questionId], asserted by
+         * [ownerId]. Decode/encode only — no relay path consumes it yet.
+         */
+        data class SummaryClaim(val questionId: String, val ownerId: String) : Frame
 
         /** Malformed or unrecognised line; the reader skips it without dropping the link. */
         data object Unknown : Frame
@@ -94,8 +133,15 @@ object MessageWire {
             status = MessageStatus.SENT,
         )
 
-    /** Serialises a chat message as a [TYPE_MSG] frame. */
-    fun encode(message: Message): String = encodeMessage(message, TYPE_MSG)
+    /**
+     * Serialises a chat message as a [TYPE_MSG] frame.
+     *
+     * [hop]/[originId] are the Stage-1 bridge envelope fields; they default so
+     * existing layer-2/3 callers (which pass only [message]) are unaffected and
+     * emit the same shape as before (hop=0, originId omitted).
+     */
+    fun encode(message: Message, hop: Int = 0, originId: String? = null): String =
+        encodeMessage(message, TYPE_MSG, hop, originId)
 
     /** Serialises a chat message as a [TYPE_SYNC_RESP] backfill frame. */
     fun encodeSyncResp(message: Message): String = encodeMessage(message, TYPE_SYNC_RESP)
@@ -104,11 +150,34 @@ object MessageWire {
     fun encodeSyncReq(since: Long): String =
         JSONObject().put("type", TYPE_SYNC_REQ).put("since", since).toString() + "\n"
 
-    /** Serialises a layer-4 "summarise recent chat" request. */
-    fun encodeSummaryReq(since: Long = 0L): String =
-        JSONObject().put("type", TYPE_SUMMARY_REQ).put("since", since).toString() + "\n"
+    /**
+     * Serialises a layer-4 "summarise recent chat" request. [questionId] is the
+     * Stage-1 bridge field (null = omitted) for later claim correlation.
+     */
+    fun encodeSummaryReq(since: Long = 0L, questionId: String? = null): String {
+        val json = JSONObject().put("type", TYPE_SUMMARY_REQ).put("since", since)
+        if (questionId != null) json.put("questionId", questionId)
+        return json.toString() + "\n"
+    }
 
-    private fun encodeMessage(message: Message, type: String): String {
+    /** Serialises a Stage-1 [TYPE_BRIDGE_HELLO] hub self-announcement. */
+    fun encodeBridgeHello(deviceId: String): String =
+        JSONObject().put("type", TYPE_BRIDGE_HELLO).put("deviceId", deviceId).toString() + "\n"
+
+    /** Serialises a Stage-1 [TYPE_SUMMARY_CLAIM] ownership assertion. */
+    fun encodeSummaryClaim(questionId: String, ownerId: String): String =
+        JSONObject()
+            .put("type", TYPE_SUMMARY_CLAIM)
+            .put("questionId", questionId)
+            .put("ownerId", ownerId)
+            .toString() + "\n"
+
+    private fun encodeMessage(
+        message: Message,
+        type: String,
+        hop: Int = 0,
+        originId: String? = null,
+    ): String {
         val json = JSONObject()
             .put("type", type)
             .put("id", message.id)
@@ -116,6 +185,8 @@ object MessageWire {
             .put("senderName", message.senderName)
             .put("body", message.body)
             .put("createdAt", message.createdAt)
+            .put("hop", hop)
+        if (originId != null) json.put("originId", originId)
         return json.toString() + "\n"
     }
 
@@ -142,9 +213,20 @@ object MessageWire {
                         createdAt = json.getLong("createdAt"),
                         status = MessageStatus.SENT,
                     ),
+                    // Bridge envelope: absent on legacy peers -> hop 0 / no origin.
+                    hop = json.optInt("hop", 0),
+                    originId = json.optStringOrNull("originId"),
                 )
                 TYPE_SYNC_REQ -> Frame.SyncReq(json.getLong("since"))
-                TYPE_SUMMARY_REQ -> Frame.SummaryReq(json.optLong("since", 0L))
+                TYPE_SUMMARY_REQ -> Frame.SummaryReq(
+                    json.optLong("since", 0L),
+                    json.optStringOrNull("questionId"),
+                )
+                TYPE_BRIDGE_HELLO -> Frame.BridgeHello(json.getString("deviceId"))
+                TYPE_SUMMARY_CLAIM -> Frame.SummaryClaim(
+                    json.getString("questionId"),
+                    json.getString("ownerId"),
+                )
                 else -> Frame.Unknown
             }
         } catch (_: Exception) {
@@ -158,4 +240,12 @@ object MessageWire {
      */
     fun decode(line: String): Message? =
         (decodeFrame(line) as? Frame.Msg)?.message
+
+    /**
+     * Returns the string at [key], or null when the key is absent or JSON-null.
+     * org.json's `optString` collapses both to "", which we must not treat as a
+     * present empty value for optional bridge fields.
+     */
+    private fun JSONObject.optStringOrNull(key: String): String? =
+        if (isNull(key) || !has(key)) null else getString(key)
 }
