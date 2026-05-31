@@ -172,10 +172,21 @@ private data class MeshConfig(
     val bridgeHost: String,
 )
 
-/** Human-readable one-liner for the notification / future UI reuse. */
+/**
+ * Human-readable one-liner for the notification / future UI reuse.
+ *
+ * Bridge status is appended ONLY when a bridge is in play ([MeshState.Hub.bridge]
+ * is non-null). When it is null — every non-bridge deployment, including the
+ * default — the string is byte-for-byte identical to the pre-bridge form, so a
+ * plain hub's notification does not change at all (zero regression).
+ */
 private fun MeshState.describe(): String = when (this) {
     is MeshState.Idle -> "Idle"
-    is MeshState.Hub -> "Hub · $peerCount peer(s)"
+    is MeshState.Hub -> "Hub · $peerCount peer(s)" + when (bridge) {
+        null -> ""
+        true -> " · ブリッジ: 接続"
+        false -> " · ブリッジ: 切断（再接続中）"
+    }
     is MeshState.Connecting -> "Connecting to $host…"
     is MeshState.Connected -> "Connected to $host"
     is MeshState.Disconnected -> "Disconnected · $reason"

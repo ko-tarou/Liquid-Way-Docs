@@ -119,6 +119,17 @@ class MeshController private constructor(
     // keep feeding the controller's stream.
     private var stateMirrorJob: Job? = null
 
+    // Mirrors the bridge MeshClient's own connect/disconnect into the Hub state.
+    private var bridgeStateJob: Job? = null
+
+    // Latest raw state of each link, so [foldBridge] can recompute the published
+    // Hub(bridge=…) from whichever stream just changed without losing the other.
+    @Volatile
+    private var lastPrimaryState: MeshState = MeshState.Idle
+
+    @Volatile
+    private var lastBridgeState: MeshState = MeshState.Idle
+
     // Single-flight guard for the outbox drain. Prevents a reconnect storm (or
     // hub + leaf both firing onLinkEstablished) from sending a message twice.
     private val flushMutex = Mutex()
@@ -168,8 +179,17 @@ class MeshController private constructor(
             MeshClient(host = host, events = this)
         }
         transport = t
-        // Mirror the transport's state into the controller's stream.
-        stateMirrorJob = scope.launch { t.state.collect { _state.value = it } }
+        // Mirror the transport's state into the controller's stream. On a hub
+        // (A-side) we additionally fold the bridge MeshClient's liveness into the
+        // Hub state so the notification shows the bridge as up/down/reconnecting.
+        // When there is no bridge, foldBridge is a no-op and the primary state is
+        // published verbatim (zero regression).
+        stateMirrorJob = scope.launch {
+            t.state.collect {
+                lastPrimaryState = it
+                _state.value = foldBridge(it)
+            }
+        }
         t.start()
 
         // Bridge: a hub-only secondary link to a second hub. Default OFF means
@@ -182,6 +202,15 @@ class MeshController private constructor(
                 deviceId = settings.deviceId(),
             )
             bridge = b
+            // Reflect the bridge link's own connect/disconnect/reconnect into the
+            // controller's Hub state. Re-published whenever EITHER the primary
+            // (peer count) or the bridge link changes.
+            bridgeStateJob = scope.launch {
+                b.state.collect {
+                    lastBridgeState = it
+                    _state.value = foldBridge(lastPrimaryState)
+                }
+            }
             b.start()
             Log.i(TAG, "Bridge enabled -> $bridgeHost")
         }
@@ -261,17 +290,50 @@ class MeshController private constructor(
      * to push proactively, so for it this is a no-op beyond a log line.
      */
     override suspend fun onLinkEstablished(transport: MeshTransport) {
-        // The bridge link is this controller's own secondary MeshClient. It is
-        // NOT a leaf-to-hub link, so it must not drive leaf-side catch-up
-        // (sync_req / outbox flush) — that would let one hub's outbox spill onto
-        // the second hub. Bridge catch-up (history merge across hubs) is a later
-        // PR; here the bridge only carries live forwarded chat.
-        if (transport === bridge) return
+        if (transport === bridge) {
+            // The bridge (re)connected. Partition recovery, B->A direction: ask
+            // the second hub for everything we missed while the bridge was down
+            // and replay it locally. We send ONLY sync_req here — never the
+            // outbox: a hub's LOCAL rows belong to its own leaves and must not
+            // spill onto the second hub. (A->B recovery is symmetric: the far
+            // hub's MeshServer sends us a sync_req on our opening bridge_hello,
+            // which our BRIDGE client answers — see MeshClient/MeshServer.)
+            // Bridge backfill arriving here lands via ingest(fromBridge=true), so
+            // the seen-set + DAO dedup prevent any echo or duplicate.
+            transport.sendRaw(
+                MessageWire.encodeSyncReq(repository.latestCreatedAt()),
+            )
+            return
+        }
         if (transport is MeshClient) {
             val since = repository.latestCreatedAt()
             transport.sendRaw(MessageWire.encodeSyncReq(since))
         }
         flushOutbox()
+    }
+
+    /**
+     * Stage-1 bridge partition recovery: our backfill high-water mark, shared by
+     * BOTH recovery directions (the far hub asks us for this via sync_req on the
+     * bridge; we ask the far hub for ours in [onLinkEstablished]).
+     */
+    override suspend fun bridgeWatermark(): Long = repository.latestCreatedAt()
+
+    /**
+     * Fold the A-side bridge MeshClient's liveness into a [MeshState.Hub] so the
+     * notification can show the inter-hub bridge as up / down / reconnecting.
+     *
+     * Zero-regression contract: when there is NO bridge configured ([bridge] is
+     * null) this returns [primary] untouched — so a plain hub publishes
+     * `Hub(peerCount)` with `bridge = null`, byte-for-byte the pre-bridge state.
+     * It only ever annotates a [MeshState.Hub] (the device is the hub that owns
+     * the outbound bridge); any other state passes through unchanged.
+     */
+    private fun foldBridge(primary: MeshState): MeshState {
+        if (bridge == null) return primary
+        if (primary !is MeshState.Hub) return primary
+        val up = lastBridgeState is MeshState.Connected
+        return primary.copy(bridge = up)
     }
 
     // ---- Layer 4: AI summary (server-only) -------------------------------
@@ -447,6 +509,10 @@ class MeshController private constructor(
     private suspend fun teardown() {
         stateMirrorJob?.cancel()
         stateMirrorJob = null
+        bridgeStateJob?.cancel()
+        bridgeStateJob = null
+        lastPrimaryState = MeshState.Idle
+        lastBridgeState = MeshState.Idle
         // Per-request scope: a generation tied to the old transport must not
         // outlive it. Cancel it before dropping the socket so it cannot relay
         // onto a torn-down transport or leak across a mode/host switch.

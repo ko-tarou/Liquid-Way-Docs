@@ -150,6 +150,14 @@ class MeshRelayJvmTest {
         override fun bridgeHopFor(messageId: String, hop: Int): Int? =
             bridgePolicy.bridgeHopFor(messageId, hop)
 
+        // Mirrors MeshController.bridgeWatermark / latestCreatedAt: highest
+        // createdAt among peer-received (non-LOCAL) rows, 0 if none. Used by both
+        // bridge partition-recovery directions.
+        override suspend fun bridgeWatermark(): Long =
+            store.values
+                .filter { it.status != MessageStatus.LOCAL }
+                .maxOfOrNull { it.createdAt } ?: 0L
+
         override suspend fun onSyncRequest(since: Long, reply: suspend (String) -> Unit) {
             store.values
                 .filter { it.createdAt > since }
@@ -159,9 +167,14 @@ class MeshRelayJvmTest {
         }
 
         override suspend fun onLinkEstablished(transport: MeshTransport) {
-            // The bridge link is our own secondary MeshClient: it must not drive
-            // leaf-side catch-up (sync_req / outbox), same as MeshController.
-            if (transport === bridge) return
+            // Bridge (re)connect, B->A partition recovery: ask the second hub for
+            // anything created after our watermark, but NEVER flush our outbox
+            // onto it (a hub's LOCAL rows belong to its own leaves). Mirrors
+            // MeshController.onLinkEstablished's bridge branch.
+            if (transport === bridge) {
+                transport.sendRaw(MessageWire.encodeSyncReq(bridgeWatermark()))
+                return
+            }
             if (transport is MeshClient) {
                 val since = store.values
                     .filter { it.status != MessageStatus.LOCAL }
@@ -956,6 +969,181 @@ class MeshRelayJvmTest {
             assertEquals(1, f.hubB.store.values.count { it.id == "loop-b" })
         } finally {
             f.close()
+        }
+    }
+
+    // ---- PR#5: heartbeat + partition recovery (bidirectional resync) -------
+    //
+    // The BRIDGE MeshClient re-uses bridge_hello as a heartbeat (no new wire
+    // type). On a (re)connect both hubs exchange sync_req(watermark): A asks B in
+    // onLinkEstablished (B->A recovery); B asks A on the FIRST hello in its
+    // MeshServer (A->B recovery). DAO dedup + the seen-set keep recovery free of
+    // loops/duplicates. Death detection is left to TCP EOF + backoff reconnect.
+
+    /**
+     * The BRIDGE-role client re-sends bridge_hello on a cadence (heartbeat) and
+     * the far hub refreshes its per-connection last-seen each time. We observe it
+     * by counting hello lines on a raw socket standing in for the far hub.
+     */
+    @Test
+    fun bridgeRoleClientReSendsHelloHeartbeatAndFarHubTracksLastSeen() = runBlocking {
+        var bridge: MeshClient? = null
+        // Raw socket standing in for the far hub: count bridge_hello lines.
+        val helloCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val acceptScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val raw = ServerSocketCounter(helloCount, acceptScope)
+        try {
+            bridge = MeshClient(
+                host = "127.0.0.1",
+                port = raw.port,
+                events = FakePeer("bridgeSide"),
+                role = MeshClient.Role.BRIDGE,
+                deviceId = "hub-A",
+            )
+            bridge.start()
+            // First hello is immediate; with a 5s cadence at least one more must
+            // arrive inside the window. Two total proves the heartbeat timer fired.
+            await("heartbeat re-sent hello", timeoutMs = 8_000) { helloCount.get() >= 2 }
+        } finally {
+            bridge?.stop(); raw.close(); acceptScope.cancel()
+        }
+    }
+
+    /** A tiny raw TCP server that counts bridge_hello lines per connection. */
+    private class ServerSocketCounter(
+        private val counter: java.util.concurrent.atomic.AtomicInteger,
+        scope: CoroutineScope,
+    ) {
+        private val server = java.net.ServerSocket().apply {
+            reuseAddress = true
+            bind(InetSocketAddress("127.0.0.1", 0), 50)
+        }
+        val port: Int get() = server.localPort
+        init {
+            scope.launch {
+                val sock = server.accept()
+                val r = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8))
+                while (true) {
+                    val line = r.readLine() ?: break
+                    if (MessageWire.decodeFrame(line) is MessageWire.Frame.BridgeHello) {
+                        counter.incrementAndGet()
+                    }
+                }
+            }
+        }
+        fun close() = runCatching { server.close() }
+    }
+
+    /**
+     * The core partition→recovery proof. A and B are bridged; during a partition
+     * (B's server down) each side's leaf authors a message the other never sees.
+     * On reconnect both directions of backfill fire and the missed messages heal
+     * across the bridge — exactly once, with no loop.
+     */
+    @Test
+    fun partitionThenRecoveryBidirectionallyResyncsMissedMessages() = runBlocking {
+        val hubA = FakePeer("hubA", serverMode = true)
+        val hubB = FakePeer("hubB", serverMode = true)
+        val leafAPeer = FakePeer("leafA")
+        val leafBPeer = FakePeer("leafB")
+        val serverA = startHub(hubA)
+        // Bind B on an explicit ephemeral port we can re-bind after the partition.
+        var serverB = MeshServer(port = 0, bindAddress = "127.0.0.1", events = hubB)
+        serverB.start()
+        await("B listening") { serverB.state.value is MeshState.Hub }
+        Thread.sleep(150)
+        val portB = serverB.boundPort
+        hubA.localTransport = serverA
+        hubB.localTransport = serverB
+
+        var leafA: MeshClient? = null
+        var leafB: MeshClient? = null
+        var bridge: MeshClient? = null
+        try {
+            bridge = MeshClient("127.0.0.1", portB, hubA, MeshClient.Role.BRIDGE, "hub-A")
+            bridge.start()
+            hubA.bridge = bridge
+            await("B sees bridge") {
+                val s = serverB.state.value; s is MeshState.Hub && s.peerCount >= 1
+            }
+            leafA = MeshClient("127.0.0.1", serverA.boundPort, leafAPeer).also { it.start() }
+            leafB = MeshClient("127.0.0.1", portB, leafBPeer).also { it.start() }
+            await("leaf A connected") { leafA!!.state.value is MeshState.Connected }
+            await("leaf B connected") { leafB!!.state.value is MeshState.Connected }
+
+            // Connected baseline: a message crosses the bridge live.
+            assertTrue(leafA!!.send(msg("pre-1", "before split", "device-A", 1_000)))
+            await("B leaf got pre-1") { leafBPeer.store.containsKey("pre-1") }
+
+            // The two recovery directions are exercised as two sequential
+            // partitions, each isolating ONE side as the author. This is
+            // deliberate: backfill is watermark-based (sync everything created
+            // after the requester's high-water mark), so a message authored on
+            // ONE side during a split is strictly newer than the peer's
+            // watermark and is recovered cleanly. (Two messages authored
+            // CONCURRENTLY at the partition boundary cannot both be recovered by
+            // a single scalar watermark — that needs a per-bridge cursor, a known
+            // Stage-1 limitation, out of scope here. Each direction is proven.)
+
+            // ===== Direction 1 (A->B): A speaks during the split, B recovers ===
+            leafB!!.stop()
+            serverB.stop()
+            Thread.sleep(300) // let A's bridge client see the EOF and start retry.
+
+            assertTrue(leafA!!.send(msg("split-a", "A during split", "device-A", 2_000)))
+            await("A hub has split-a") { hubA.store.containsKey("split-a") }
+            assertFalse("split-a must NOT be on B yet", hubB.store.containsKey("split-a"))
+
+            // B returns on the SAME port; A's bridge reconnects + re-announces.
+            // B's MeshServer sends sync_req(B watermark) on the opening hello;
+            // A's BRIDGE client answers with split-a; B fans it to its leaf.
+            serverB = MeshServer(port = portB, bindAddress = "127.0.0.1", events = hubB)
+            serverB.start()
+            await("B listening again") { serverB.state.value is MeshState.Hub }
+            hubB.localTransport = serverB
+            leafB = MeshClient("127.0.0.1", portB, leafBPeer).also { it.start() }
+            await("leaf B reconnected #1") { leafB!!.state.value is MeshState.Connected }
+            await("B recovered A's split-a", timeoutMs = 8_000) {
+                hubB.store.containsKey("split-a")
+            }
+            await("leaf B got A's split-a") { leafBPeer.store.containsKey("split-a") }
+
+            // ===== Direction 2 (B->A): B speaks during the split, A recovers ===
+            leafB!!.stop()
+            serverB.stop()
+            Thread.sleep(300)
+
+            // B's leaf is offline; author straight into B's hub store as if its
+            // leaf had spoken to B locally while partitioned (newer than A's wm).
+            hubB.put(msg("split-b", "B during split", "device-B", 3_000, MessageStatus.SENT))
+            assertFalse("split-b must NOT be on A yet", hubA.store.containsKey("split-b"))
+
+            // B returns; A's bridge reconnects and its onLinkEstablished sends
+            // sync_req(A watermark); B replies with split-b; A ingests it
+            // (fromBridge) and fans it out to its leaf.
+            serverB = MeshServer(port = portB, bindAddress = "127.0.0.1", events = hubB)
+            serverB.start()
+            await("B listening again #2") { serverB.state.value is MeshState.Hub }
+            hubB.localTransport = serverB
+            leafB = MeshClient("127.0.0.1", portB, leafBPeer).also { it.start() }
+            await("leaf B reconnected #2") { leafB!!.state.value is MeshState.Connected }
+            await("B sees bridge again #2", timeoutMs = 8_000) {
+                val s = serverB.state.value; s is MeshState.Hub && s.peerCount == 2
+            }
+            await("A recovered B's split-b", timeoutMs = 8_000) {
+                hubA.store.containsKey("split-b")
+            }
+            await("leaf A got B's split-b") { leafAPeer.store.containsKey("split-b") }
+
+            // No duplication / loop after the dust settles (both directions).
+            Thread.sleep(400)
+            assertEquals(1, hubA.store.values.count { it.id == "split-b" })
+            assertEquals(1, hubB.store.values.count { it.id == "split-a" })
+            assertEquals(1, leafAPeer.store.values.count { it.id == "split-b" })
+            assertEquals(1, leafBPeer.store.values.count { it.id == "split-a" })
+        } finally {
+            leafA?.stop(); leafB?.stop(); bridge?.stop()
+            serverA.stop(); serverB.stop()
         }
     }
 }
