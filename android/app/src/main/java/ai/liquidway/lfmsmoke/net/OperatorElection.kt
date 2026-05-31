@@ -211,3 +211,60 @@ class OperatorElection(
         fun clamp(queueDepth: Int): Int = queueDepth.coerceIn(0, MAX_QUEUE_DEPTH)
     }
 }
+
+/**
+ * Operator-layer 3: **the advisory dispatch target** — pure, vote-free selection
+ * of the hub the operator wants to preferentially claim a new summary.
+ *
+ * THE RULE (deterministic, mirror image of the election): the **least loaded**
+ * live candidate — lowest clamped [HubLoad.queueDepth], ties broken by the
+ * **lexicographically smallest deviceId** — so the busiest hub (the operator)
+ * sheds new work to the idlest peer. Like [OperatorElection] this is a pure
+ * total-order function over the same gossiped picture, so it is deterministic
+ * and unit-testable in isolation.
+ *
+ * It is ONLY consumed as a hint: the chosen target gets a zero-delay claim while
+ * other hubs wait a short fallback window before claiming. The claim CAS
+ * ([QuestionOwnership]) remains the correctness floor — the hint can only change
+ * *who claims first*, never whether a question ends up single-owned, and if the
+ * target never claims another hub still claims after the fallback (liveness).
+ *
+ * Untrusted: queueDepth/deviceId are peer self-reports; clamping bounds the load
+ * but a spoofed id could mis-steer the hint. Accepted under the Stage-1 same-LAN
+ * trust model (Task #21) — a bad hint at worst lowers efficiency, never breaks
+ * single ownership or liveness.
+ */
+object DispatchTarget {
+
+    /**
+     * Pick the least-loaded live hub from [selfId]+[peers] (peers older than
+     * [staleMs] are aged out, mirroring the election). Returns the chosen
+     * deviceId, or null when there is no peer at all (a lone hub needs no hint —
+     * it is trivially its own target and claims immediately anyway).
+     */
+    fun choose(
+        selfId: String,
+        selfLoad: HubLoad,
+        peers: Map<String, MeshController.PeerLoad>,
+        now: Long,
+        staleMs: Long = OperatorElection.DEFAULT_PEER_STALE_MS,
+    ): String? {
+        val live = peers.entries.filter { (id, pl) ->
+            id != selfId && now - pl.seenAt <= staleMs
+        }
+        // No live peer -> no meaningful hint (self is the only candidate).
+        if (live.isEmpty()) return null
+        var bestId = selfId
+        var bestDepth = OperatorElection.clamp(selfLoad.queueDepth)
+        for ((id, pl) in live) {
+            val depth = OperatorElection.clamp(pl.load.queueDepth)
+            // Strictly-less wins; on a tie keep the lexicographically smaller id
+            // for a deterministic, cross-hub-stable choice.
+            if (depth < bestDepth || (depth == bestDepth && id < bestId)) {
+                bestId = id
+                bestDepth = depth
+            }
+        }
+        return bestId
+    }
+}

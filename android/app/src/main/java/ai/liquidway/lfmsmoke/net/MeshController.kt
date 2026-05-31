@@ -44,6 +44,17 @@ import java.util.concurrent.atomic.AtomicInteger
 class MeshController private constructor(
     private val repository: MessageRepository,
     private val settings: SettingsRepository,
+    /**
+     * Operator-layer 3: how long a hub that is NOT the dispatch target waits
+     * before it falls back to claiming a question itself. During this window the
+     * target (which claims with zero delay) normally claims first, so the
+     * non-target stands down on the arriving `summary_claim` — that is the load
+     * balancing. If the target is dead and never claims, the non-target claims
+     * after this window so the answer is never lost (liveness). Injectable so a
+     * test can drive it to 0 (immediate) or a small value deterministically;
+     * production uses [DEFAULT_DISPATCH_FALLBACK_MS].
+     */
+    private val dispatchFallbackMs: Long = DEFAULT_DISPATCH_FALLBACK_MS,
 ) : MeshEvents {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -123,6 +134,40 @@ class MeshController private constructor(
      * routing is unchanged (zero regression).
      */
     val amIOperator: StateFlow<Boolean> = _amIOperator.asStateFlow()
+
+    /**
+     * Operator-layer 3: the freshest advisory dispatch hint received from the
+     * operator over a bridge_hello — which hub it wants to claim a new summary
+     * preferentially, and when we heard it. Null target / null holder means no
+     * usable hint (operator absent or never seen). [seenAt] ages the hint out so
+     * a dead operator's stale hint cannot pin claim timing forever — once stale,
+     * the controller falls straight back to the PR#6 per-request-ownership path.
+     */
+    @Volatile
+    private var dispatchHint: DispatchHint? = null
+
+    /** A received dispatch hint plus when it arrived (for staleness aging). */
+    private data class DispatchHint(val target: String?, val seenAt: Long)
+
+    /**
+     * Operator-layer 3: the dispatch target THIS hub should bias its claim
+     * timing toward, or null to fall back to the PR#6 floor.
+     *
+     *  - If this hub IS the operator, it uses its OWN freshly-computed target
+     *    ([localDispatchTarget]); the operator never relies on a received hint
+     *    (it does not hear its own). Mirrors how the operator advertises.
+     *  - Otherwise it uses the freshest hint a peer (the operator) advertised,
+     *    provided it is within the stale window (the same window the election
+     *    uses, so a quiet operator ages out of both consistently).
+     *
+     * Either way this is purely a timing input — the claim CAS is the floor.
+     */
+    private fun effectiveDispatchTarget(now: Long): String? {
+        if (_amIOperator.value) return localDispatchTarget()
+        val h = dispatchHint ?: return null
+        if (now - h.seenAt > OperatorElection.DEFAULT_PEER_STALE_MS) return null
+        return h.target
+    }
 
     /**
      * Operator-layer 2: recompute the operator from the current load picture and
@@ -442,9 +487,48 @@ class MeshController private constructor(
         peerLoads[deviceId] = PeerLoad(load, System.currentTimeMillis())
         Log.d(TAG, "Peer $deviceId load: queue=${load.queueDepth} dispatched=${load.dispatchCount}")
         // Operator-layer 2: refresh the elected operator from the new picture.
-        // Pure computation + StateFlow publish; nothing acts on the result here
-        // (routing/ownership unchanged — that is PR#9).
         recomputeOperator()
+    }
+
+    /**
+     * Operator-layer 3: the advisory dispatch hint this hub advertises on its
+     * outgoing/echoed bridge_hello. Non-null ONLY when this hub is the elected
+     * operator AND there is a live peer to point at — then it is the least-loaded
+     * hub ([DispatchTarget]). A non-operator hub (or a lone operator with no
+     * peers) advertises null, so a non-operator never steers dispatch and a
+     * single hub emits nothing extra (zero regression). Computed fresh per hello
+     * from the current gossiped picture, mirroring how the election is computed.
+     */
+    override fun localDispatchTarget(): String? {
+        if (!_amIOperator.value) return null
+        val self = cachedSelfId ?: return null
+        return DispatchTarget.choose(
+            selfId = self,
+            selfLoad = localLoad(),
+            peers = peerLoads,
+            now = System.currentTimeMillis(),
+        )
+    }
+
+    /**
+     * Operator-layer 3: record the freshest dispatch hint a peer (the operator)
+     * advertised on its bridge_hello. Stored with a timestamp so it ages out;
+     * consumed only to bias claim TIMING in [onSummaryRequest] — never to change
+     * who ends up owning a question (that is the claim CAS). On a single hub no
+     * hello ever arrives, so this is never called and the hint stays null.
+     */
+    override suspend fun onDispatchHint(fromDeviceId: String, target: String?) {
+        // Only the elected operator's hint counts. A non-operator hello (which
+        // carries a null target) must NOT clobber the operator's live hint — that
+        // would erase the bias every heartbeat. Until the first election names an
+        // operator we accept any hint (bootstrap); thereafter we gate on it.
+        val op = _effectiveOperatorId.value
+        if (op != null && fromDeviceId != op) {
+            Log.d(TAG, "Ignoring dispatch hint from non-operator $fromDeviceId")
+            return
+        }
+        dispatchHint = DispatchHint(target, System.currentTimeMillis())
+        Log.d(TAG, "Dispatch hint from $fromDeviceId -> target=$target")
     }
 
     /**
@@ -511,10 +595,57 @@ class MeshController private constructor(
         // answer can occur. Known Stage-1 limitation (modern leaves are fine).
         val qid = questionId ?: UUID.randomUUID().toString()
 
+        val self = selfId()
+
+        // Operator-layer 3: advisory dispatch — bias WHEN we attempt the claim,
+        // never WHETHER the question stays single-owned (the CAS in
+        // [claimAndGenerate] is the floor). Three cases:
+        //  - no fresh hint (operator absent/stale) -> PR#6 path: claim NOW
+        //    (claim precedes the forwarded request on the same ordered socket,
+        //    so the far hub stands down -> single owner, exactly as PR#6).
+        //  - fresh hint and WE are the target      -> claim NOW (we are the
+        //    chosen, idlest hub); same PR#6 claim-first ordering.
+        //  - fresh hint and we are NOT the target  -> forward the request to the
+        //    far hub FIRST (so the target hub actually receives it and can
+        //    claim), THEN defer OUR claim by [dispatchFallbackMs]. Normally the
+        //    target claims first and its summary_claim makes our deferred
+        //    tryClaim stand down (load balanced). If the target is dead and never
+        //    claims, our deferred attempt still wins after the window, so the
+        //    answer is never lost (liveness). On a single hub the hint is always
+        //    null, so this branch is never taken (zero regression).
+        val target = effectiveDispatchTarget(System.currentTimeMillis())
+        if (target != null && target != self) {
+            Log.i(TAG, "summary_req $qid: target=$target is not us; deferring ${dispatchFallbackMs}ms")
+            // Hand the request to the far hub so the target can claim it. We do
+            // NOT claim or announce here — that is the whole point of deferring.
+            bridge?.let { b ->
+                if (questionOwnership.shouldForward(qid)) {
+                    b.sendRaw(MessageWire.encodeSummaryReq(since, qid))
+                }
+            }
+            scope.launch {
+                kotlinx.coroutines.delay(dispatchFallbackMs)
+                claimAndGenerate(since, qid, self)
+            }
+            return
+        }
+        claimAndGenerate(since, qid, self)
+    }
+
+    /**
+     * The claim + cross-bridge announce + (single-flight) generation, shared by
+     * the immediate and the deferred dispatch paths. The claim CAS here is the
+     * correctness floor: regardless of how dispatch timing biased our arrival, a
+     * foreign owner means we stand down, so a question stays single-owned (a
+     * simultaneous cross-ack to at most two; a third suppressed).
+     */
+    private suspend fun claimAndGenerate(since: Long, qid: String, self: String) {
         // Per-question ownership CAS. If a peer hub's claim already arrived we
-        // stand down here (the single-owner common case). On a single hub this
-        // always wins (no peer can have claimed), so behaviour is unchanged.
-        if (!questionOwnership.tryClaim(qid, selfId())) {
+        // stand down here (the single-owner common case — and exactly how a
+        // deferred non-target stands down once the target has claimed). On a
+        // single hub this always wins (no peer can have claimed), so behaviour
+        // is unchanged.
+        if (!questionOwnership.tryClaim(qid, self)) {
             Log.i(TAG, "summary_req $qid already owned by a peer; standing down")
             return
         }
@@ -524,12 +655,11 @@ class MeshController private constructor(
         // the same ordered bridge socket, so claim-first guarantees the far hub
         // sees it first). A genuinely simultaneous claim (both hubs originate
         // before either's claim lands) crosses in flight -> both answer
-        // (two-bubble cross-ack), handled in [onSummaryClaim].
+        // (two-bubble cross-ack), handled in [onSummaryClaim]. shouldForward is
+        // the forward-once guard, so a request the deferred path already
+        // forwarded is not sent twice.
         bridge?.let { b ->
-            b.sendRaw(MessageWire.encodeSummaryClaim(qid, selfId()))
-            // Fan the request across the bridge (once per question) so the second
-            // hub can also answer if WE later fail. No-op on a single hub
-            // (bridge==null). The forward-once guard stops a ping-pong.
+            b.sendRaw(MessageWire.encodeSummaryClaim(qid, self))
             if (questionOwnership.shouldForward(qid)) {
                 b.sendRaw(MessageWire.encodeSummaryReq(since, qid))
             }
@@ -755,6 +885,9 @@ class MeshController private constructor(
         operatorElection.reset()
         _effectiveOperatorId.value = null
         _amIOperator.value = false
+        // Operator-layer 3: drop any dispatch hint so a reconfigure starts on the
+        // PR#6 floor until a fresh operator advertises again.
+        dispatchHint = null
         _state.value = MeshState.Idle
     }
 
@@ -772,6 +905,16 @@ class MeshController private constructor(
          */
         private const val BACKFILL_MAX_MESSAGES = 500
         private const val BACKFILL_MAX_AGE_MS = 24L * 60 * 60 * 1000 // 24h
+
+        /**
+         * Operator-layer 3: default fallback delay a NON-target hub waits before
+         * claiming a question itself. Long enough that the chosen target (which
+         * claims immediately) and its `summary_claim` normally reach this hub
+         * first — so the non-target stands down and load is balanced — yet short
+         * enough that a dead target only delays the answer briefly before another
+         * hub claims (liveness). Comfortably under a user's patience for a summary.
+         */
+        const val DEFAULT_DISPATCH_FALLBACK_MS = 600L
 
         @Volatile
         private var instance: MeshController? = null
