@@ -64,10 +64,24 @@ class MeshClient(
         const val MIN_BACKOFF_MS = 250L
         const val MAX_BACKOFF_MS = 15_000L
         const val CONNECT_TIMEOUT_MS = 5_000
+
+        /**
+         * Bridge liveness: a BRIDGE-role client re-sends its [bridge_hello] on
+         * this cadence so the far hub can show "bridge alive" (last-seen). It
+         * deliberately re-uses the existing hello frame — no new wire type, so
+         * old peers stay compatible. Death detection is NOT timer-driven here:
+         * the TCP read EOF + capped-backoff reconnect already self-heal a dropped
+         * link, so an active timeout-disconnect would be redundant complexity.
+         */
+        const val BRIDGE_HEARTBEAT_MS = 5_000L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var loopJob: Job? = null
+
+    // BRIDGE role only: re-sends bridge_hello on a cadence. Restarted on every
+    // (re)connect (so it writes to the live socket) and cancelled on link loss.
+    private var heartbeatJob: Job? = null
 
     @Volatile
     private var socket: Socket? = null
@@ -127,6 +141,7 @@ class MeshClient(
             // line the far hub reads on this connection.
             if (role == Role.BRIDGE) {
                 sendRaw(MessageWire.encodeBridgeHello(deviceId ?: "bridge"))
+                startHeartbeat()
             }
 
             // Layer 3: drain the outbox and ask the hub for anything we missed
@@ -154,9 +169,18 @@ class MeshClient(
                                 fromBridge = role == Role.BRIDGE,
                             )
                         is MessageWire.Frame.SyncReq ->
-                            // A leaf never serves backfill (only the hub does);
-                            // ignore defensively.
-                            Log.d(TAG, "Ignoring sync_req on leaf")
+                            if (role == Role.BRIDGE) {
+                                // Partition recovery (A->B direction): the far
+                                // hub (B) asked THIS hub (A) for backfill on the
+                                // bridge link. Answer from our store onto the
+                                // same socket, exactly as a hub answers a leaf.
+                                // A PRIMARY leaf still ignores sync_req (below).
+                                events.onSyncRequest(f.since) { reply -> sendRaw(reply) }
+                            } else {
+                                // A leaf never serves backfill (only the hub
+                                // does); ignore defensively.
+                                Log.d(TAG, "Ignoring sync_req on leaf")
+                            }
                         is MessageWire.Frame.SummaryReq ->
                             // A leaf never runs the model; the hub does. The
                             // hub does not relay summary_req, so a leaf should
@@ -173,6 +197,8 @@ class MeshClient(
             } catch (e: Exception) {
                 Log.w(TAG, "Read loop ended: ${e.message}")
             } finally {
+                heartbeatJob?.cancel()
+                heartbeatJob = null
                 cleanupSocket()
             }
 
@@ -180,6 +206,23 @@ class MeshClient(
                 _state.value = MeshState.Disconnected("link lost")
                 delay(backoff)
                 backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
+            }
+        }
+    }
+
+    /**
+     * BRIDGE liveness: re-send [bridge_hello] every [BRIDGE_HEARTBEAT_MS] on the
+     * live socket. Launched after the opening hello on each (re)connect and
+     * cancelled when the link drops, so it never writes to a stale socket. A
+     * failed write returns false and tears the socket down via [sendRaw], which
+     * the connect loop's backoff reconnect then heals — we do not loop on error.
+     */
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = scope.launch {
+            while (isActive) {
+                delay(BRIDGE_HEARTBEAT_MS)
+                if (!sendRaw(MessageWire.encodeBridgeHello(deviceId ?: "bridge"))) break
             }
         }
     }
@@ -210,6 +253,8 @@ class MeshClient(
     }
 
     override suspend fun stop() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
         loopJob?.cancel()
         loopJob = null
         cleanupSocket()
