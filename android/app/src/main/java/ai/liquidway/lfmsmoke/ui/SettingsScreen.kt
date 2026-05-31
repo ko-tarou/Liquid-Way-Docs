@@ -41,6 +41,8 @@ fun SettingsScreen(
     val deviceName by viewModel.deviceName.collectAsStateWithLifecycle()
     val deviceId by viewModel.deviceId.collectAsStateWithLifecycle()
     val serverHost by viewModel.serverHost.collectAsStateWithLifecycle()
+    val bridgeEnabled by viewModel.bridgeEnabled.collectAsStateWithLifecycle()
+    val bridgeHost by viewModel.bridgeHost.collectAsStateWithLifecycle()
 
     // Local editable copy; seeded from the persisted name once it resolves.
     var nameDraft by remember { mutableStateOf("") }
@@ -54,6 +56,13 @@ fun SettingsScreen(
     LaunchedEffect(serverHost) {
         if (serverHost.isNotEmpty() && hostDraft.isEmpty()) {
             hostDraft = serverHost
+        }
+    }
+
+    var bridgeHostDraft by remember { mutableStateOf("") }
+    LaunchedEffect(bridgeHost) {
+        if (bridgeHost.isNotEmpty() && bridgeHostDraft.isEmpty()) {
+            bridgeHostDraft = bridgeHost
         }
     }
 
@@ -134,6 +143,54 @@ fun SettingsScreen(
                         }
                     },
                 )
+
+                HorizontalDivider()
+            }
+
+            // Stage-1 bridge: a hub-only option to link a SECOND hub so the two
+            // same-network groups merge into one chat. Hidden for a leaf (it has
+            // nothing to bridge). Default off -> no bridge link is created.
+            if (serverMode) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "別のサーバー役の端末とつなぐ",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        Text(
+                            "もう一台のサーバー役の端末と連携し、ふたつのグループを" +
+                                "ひとつのチャットにまとめます（どちらか片方だけ設定）。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = bridgeEnabled,
+                        onCheckedChange = viewModel::setBridgeEnabled,
+                    )
+                }
+
+                if (bridgeEnabled) {
+                    OutlinedTextField(
+                        value = bridgeHostDraft,
+                        onValueChange = { bridgeHostDraft = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("相手のIPアドレス") },
+                        trailingIcon = {
+                            androidx.compose.material3.TextButton(
+                                onClick = { viewModel.setBridgeHost(bridgeHostDraft) },
+                                enabled = bridgeHostDraft.isNotBlank() &&
+                                    bridgeHostDraft != bridgeHost,
+                            ) {
+                                Text("Save")
+                            }
+                        },
+                    )
+                }
 
                 HorizontalDivider()
             }
