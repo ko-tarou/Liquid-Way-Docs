@@ -86,6 +86,15 @@ class MeshServer(
          */
         @Volatile
         var isBridge: Boolean = false
+
+        /**
+         * Stage-1 bridge liveness: epoch-ms of the last bridge_hello received on
+         * this connection (0 = never). Refreshed by every heartbeat hello so the
+         * hub can surface "bridge alive" without an extra wire type. Read/written
+         * from the per-connection reader, hence @Volatile.
+         */
+        @Volatile
+        var lastBridgeSeenAt: Long = 0L
     }
 
     override suspend fun start() {
@@ -171,8 +180,21 @@ class MeshServer(
                             // it through the forwarding policy instead of the
                             // plain leaf fan-out. deviceId is logged only;
                             // ownership/identity checks land in a later PR.
-                            conn.isBridge = true
-                            Log.i(TAG, "Client ${conn.id} is a bridge (deviceId=${f.deviceId})")
+                            conn.lastBridgeSeenAt = System.currentTimeMillis()
+                            // FIRST hello only: flip to bridge AND kick partition
+                            // recovery (A->B). We send sync_req(ourWatermark) back
+                            // on this same connection; the far hub answers it via
+                            // its BRIDGE client's onSyncRequest, replaying what we
+                            // missed while partitioned. Heartbeat hellos arrive
+                            // with isBridge already true, so they only refresh
+                            // last-seen and do NOT re-trigger the catch-up.
+                            if (!conn.isBridge) {
+                                conn.isBridge = true
+                                publishBridgePresence()
+                                val since = events.bridgeWatermark()
+                                writeTo(conn, MessageWire.encodeSyncReq(since))
+                                Log.i(TAG, "Client ${conn.id} is a bridge (deviceId=${f.deviceId}); requested backfill since=$since")
+                            }
                         }
                         // Remaining Stage-1 frame + Unknown: no relay path
                         // consumes them yet, so skip without dropping the link.
@@ -250,8 +272,35 @@ class MeshServer(
     }
 
     private fun publishPeerCount() {
-        _state.value = MeshState.Hub(clients.size)
+        _state.value = MeshState.Hub(clients.size, bridgePresence())
     }
+
+    /** Re-publishes Hub state when a bridge connection flips isBridge. */
+    private fun publishBridgePresence() = publishPeerCount()
+
+    /**
+     * Bridge liveness from THIS hub's accepted connections (the B-side view):
+     *  - `null`  — no connection has ever announced itself as a bridge, so this
+     *    hub is a plain star hub. Keeps [describe] byte-for-byte identical to the
+     *    pre-bridge string (zero regression).
+     *  - `true`  — at least one bridge connection is currently open.
+     *  - `false` — a bridge was seen this session but its socket has since
+     *    dropped (the [sawBridge] latch stays set so we report "down", not
+     *    "absent", until the link reconnects).
+     */
+    private fun bridgePresence(): Boolean? {
+        val live = clients.values.any { it.isBridge }
+        if (live) {
+            sawBridge = true
+            return true
+        }
+        return if (sawBridge) false else null
+    }
+
+    // Latches once any bridge connection has been seen, so a dropped bridge
+    // reports "down" (false) rather than reverting to "absent" (null).
+    @Volatile
+    private var sawBridge: Boolean = false
 
     /** Local fan-out: a message authored on the hub goes to all leaves. */
     override suspend fun send(message: Message): Boolean =

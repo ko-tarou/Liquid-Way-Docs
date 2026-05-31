@@ -78,4 +78,23 @@ interface MeshEvents {
      *   NOT forward (already-seen loop break, or hop ceiling reached).
      */
     fun bridgeHopFor(messageId: String, hop: Int): Int?
+
+    /**
+     * Stage-1 bridge partition-recovery: this device's backfill high-water mark
+     * (highest createdAt among messages received from a peer, status != LOCAL,
+     * or 0 when none).
+     *
+     * Used in two places when a bridge link (re)comes up so the two hubs heal
+     * any history that diverged while they were partitioned:
+     *  - the A-side BRIDGE [MeshClient] sends `sync_req(bridgeWatermark())` to
+     *    pull anything B holds that it missed (B->A recovery);
+     *  - the B-side [MeshServer], on the FIRST `bridge_hello` of a connection,
+     *    sends `sync_req(bridgeWatermark())` back so A replays what B missed
+     *    (A->B recovery). The two directions together make recovery symmetric.
+     *
+     * Default implementation returns 0 ("send me everything in the cap window"),
+     * which is safe — DAO dedup collapses overlap — so leaf-only test stand-ins
+     * need not override it.
+     */
+    suspend fun bridgeWatermark(): Long = 0L
 }
