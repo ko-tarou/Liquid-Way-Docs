@@ -244,6 +244,13 @@ class MeshController private constructor(
     @Volatile
     private var summaryJob: Job? = null
 
+    // Deferred dispatch claims (non-target hub: forward now, claim after the
+    // fallback window). Keyed by questionId because several questions can be
+    // deferring at once — a single var would drop earlier jobs. Each job removes
+    // its own entry on completion; teardown() cancels whatever remains so a
+    // stale claim cannot fire against a torn-down transport (post-teardown race).
+    private val deferredClaimJobs = ConcurrentHashMap<String, Job>()
+
     @Volatile
     private var transport: MeshTransport? = null
 
@@ -623,10 +630,18 @@ class MeshController private constructor(
                     b.sendRaw(MessageWire.encodeSummaryReq(since, qid))
                 }
             }
-            scope.launch {
-                kotlinx.coroutines.delay(dispatchFallbackMs)
-                claimAndGenerate(since, qid, self)
+            // Track the deferred claim so teardown() can cancel it; without this
+            // a reconfigure/stop during the window leaves a job that claims the
+            // (now stale) qid against a fresh transport context.
+            val job = scope.launch {
+                try {
+                    kotlinx.coroutines.delay(dispatchFallbackMs)
+                    claimAndGenerate(since, qid, self)
+                } finally {
+                    deferredClaimJobs.remove(qid)
+                }
             }
+            deferredClaimJobs[qid] = job
             return
         }
         claimAndGenerate(since, qid, self)
@@ -860,6 +875,11 @@ class MeshController private constructor(
         // onto a torn-down transport or leak across a mode/host switch.
         summaryJob?.cancel()
         summaryJob = null
+        // Deferred dispatch claims share the same per-transport lifetime: a job
+        // still waiting out its fallback window must not wake up and claim/
+        // announce a stale qid onto the next transport. Cancel + clear all.
+        deferredClaimJobs.values.forEach { it.cancel() }
+        deferredClaimJobs.clear()
         // Defensive: if the cancel raced past the coroutine's finally, clear
         // the single-flight latch so the next mode still accepts a request.
         summaryInFlight.set(false)

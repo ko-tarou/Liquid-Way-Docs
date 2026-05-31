@@ -9,6 +9,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -122,6 +123,9 @@ class MeshRelayJvmTest {
         private val summaryDispatcher = Dispatchers.IO.limitedParallelism(1)
         private val summaryInFlight = AtomicBoolean(false)
         val summaryRunning = AtomicBoolean(false)
+        // Mirrors MeshController.deferredClaimJobs: deferred (non-target) claims
+        // tracked per qid so teardown() can cancel a job still in its window.
+        val deferredClaimJobs = ConcurrentHashMap<String, Job>()
 
         // ---- Operator-layer load (mirrors MeshController) -----------------
         // This hub's advertised load, settable by a test to simulate pressure.
@@ -274,13 +278,25 @@ class MeshRelayJvmTest {
                         b.sendRaw(MessageWire.encodeSummaryReq(since, qid))
                     }
                 }
-                scope.launch {
-                    kotlinx.coroutines.delay(dispatchFallbackMs)
-                    claimAndGenerate(since, qid)
+                val job = scope.launch {
+                    try {
+                        kotlinx.coroutines.delay(dispatchFallbackMs)
+                        claimAndGenerate(since, qid)
+                    } finally {
+                        deferredClaimJobs.remove(qid)
+                    }
                 }
+                deferredClaimJobs[qid] = job
                 return
             }
             claimAndGenerate(since, qid)
+        }
+
+        // Mirrors MeshController.teardown()'s deferred-claim cancellation: a job
+        // still waiting out its window must not wake up and claim a stale qid.
+        fun teardown() {
+            deferredClaimJobs.values.forEach { it.cancel() }
+            deferredClaimJobs.clear()
         }
 
         private suspend fun claimAndGenerate(since: Long, qid: String) {
@@ -1693,6 +1709,52 @@ class MeshRelayJvmTest {
                 hub.store.values.count { it.senderId == AI_SENDER_ID } == 1
             }
             assertEquals(1, fake.callCount.get())
+        } finally {
+            client?.stop(); server.stop()
+        }
+    }
+
+    @Test
+    fun teardownCancelsADeferredClaimSoItNeverFiresPostTeardown() = runBlocking {
+        // Post-teardown race guard: a non-target hub forwards the request and
+        // defers its own claim by dispatchFallbackMs. If a reconfigure/stop
+        // happens inside that window, teardown() must cancel the deferred job so
+        // it never wakes up to claim/announce a now-stale qid against a fresh
+        // transport. Modelled with a lone hub (no bridge) and a non-self hint so
+        // the request is deferred; we tear down mid-window and assert no answer.
+        val fake = FakeSummarizationEngine()
+        val hub = FakePeer(
+            "hub", serverMode = true, engine = fake, deviceId = "hub-A",
+            dispatchFallbackMs = 500L, // window long enough to tear down inside it.
+        )
+        val server = startHub(hub)
+        hub.relayTransport = server
+        var client: MeshClient? = null
+        try {
+            client = MeshClient("127.0.0.1", server.boundPort, FakePeer("A"))
+            client.start()
+            await("connected") { client!!.state.value is MeshState.Connected }
+            hub.put(msg("c-1", "status ok", "A", 1_000, MessageStatus.SENT))
+            // Fresh hint pointing elsewhere -> the hub defers its own claim.
+            hub.receivedHint = "hub-ghost" to System.currentTimeMillis()
+
+            assertTrue(client.sendRaw(MessageWire.encodeSummaryReq(questionId = "Q-teardown")))
+            // The deferred job is registered and has NOT yet claimed.
+            await("deferred claim registered") { hub.deferredClaimJobs.containsKey("Q-teardown") }
+            assertEquals("did not claim immediately (deferred)", 0, fake.callCount.get())
+
+            // Reconfigure/stop mid-window: cancel the deferred claim.
+            hub.teardown()
+            assertTrue("deferred jobs cleared", hub.deferredClaimJobs.isEmpty())
+
+            // Wait past the original window: the cancelled job must never fire.
+            Thread.sleep(700)
+            assertEquals("no claim after teardown", 0, fake.callCount.get())
+            assertEquals(
+                "no summary produced",
+                0,
+                hub.store.values.count { it.senderId == AI_SENDER_ID },
+            )
         } finally {
             client?.stop(); server.stop()
         }
