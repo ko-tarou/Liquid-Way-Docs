@@ -62,8 +62,29 @@ interface MeshEvents {
      * onto a separate low-priority coroutine so plain chat keeps relaying.
      *
      * @param since advisory high-water mark (0 = "recent window, hub decides").
+     * @param questionId Stage-1 bridge correlation id. A leaf stamps a fresh
+     *   UUID so BOTH hubs recognise the same question and exactly one answers
+     *   (per-request ownership via [onSummaryClaim]). Null = a legacy leaf that
+     *   sent no id; the receiving hub mints one as a fallback (with old leaves
+     *   mixed in, a double-answer can occur — a known Stage-1 limitation).
      */
-    suspend fun onSummaryRequest(since: Long)
+    suspend fun onSummaryRequest(since: Long, questionId: String? = null)
+
+    /**
+     * Stage-1 bridge: a peer hub asserts ownership of [questionId] as [ownerId]
+     * (it is about to generate, or already is). The receiving hub records the
+     * claim so its own pending generation for that question stands down (the
+     * single-owner case). If THIS hub had already won the claim and started
+     * generating, the claims have crossed in flight ("すれ違い"): both hubs
+     * answer and the leaf shows two AI bubbles — the deliberate dual-option
+     * outcome. A leaf never acts on this.
+     *
+     * SECURITY: [ownerId] is the peer's untrusted self-report; identity /
+     * ownership verification is future work (same-LAN trust assumed in Stage-1).
+     *
+     * Default no-op so leaf-only test stand-ins need not override it.
+     */
+    suspend fun onSummaryClaim(questionId: String, ownerId: String) {}
 
     /**
      * Stage-1 bridge: decide whether a message may be forwarded across an
