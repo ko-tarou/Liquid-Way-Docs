@@ -88,10 +88,64 @@ class MeshController private constructor(
 
     /**
      * Read-only snapshot of every peer hub's last-reported load. A defensive copy
-     * so a caller cannot mutate the live map. Consumed by a later PR (operator
-     * selection); this PR only populates it.
+     * so a caller cannot mutate the live map. Consumed by [recomputeOperator];
+     * also kept public for tests/diagnostics.
      */
     fun peerLoadView(): Map<String, PeerLoad> = peerLoads.toMap()
+
+    /**
+     * Operator-layer 2: the deterministic, vote-free operator election (pure
+     * logic, see [OperatorElection]). Fed the same gossiped load picture every
+     * hub sees, so all hubs independently compute the same operator with no
+     * consensus protocol — split-brain-free by construction. Recomputed on every
+     * peer heartbeat via [recomputeOperator].
+     */
+    private val operatorElection = OperatorElection()
+
+    private val _effectiveOperatorId = MutableStateFlow<String?>(null)
+
+    /**
+     * Operator-layer 2 OUTPUT — observable only, no behaviour attached. The
+     * deviceId of the hub all hubs have agreed is the operator (after
+     * hysteresis), or null before the first election. PR#9 will consume this to
+     * route/dispatch; THIS PR must not let it change any routing or summary
+     * ownership. Null/self-only on a single hub (no peers), where it is inert.
+     */
+    val effectiveOperatorId: StateFlow<String?> = _effectiveOperatorId.asStateFlow()
+
+    private val _amIOperator = MutableStateFlow(false)
+
+    /**
+     * Operator-layer 2 OUTPUT — true when this hub is the elected operator.
+     * Derived from [effectiveOperatorId] == self. Observable only this PR (no
+     * action taken on it). On a single hub the lone candidate is self, so once an
+     * election has run this is trivially true — but with nothing acting on it,
+     * routing is unchanged (zero regression).
+     */
+    val amIOperator: StateFlow<Boolean> = _amIOperator.asStateFlow()
+
+    /**
+     * Operator-layer 2: recompute the operator from the current load picture and
+     * publish it. Called after a peer heartbeat updates [peerLoads]. Pure
+     * computation + StateFlow publish — it deliberately triggers NO routing or
+     * ownership change (that is PR#9). On a single hub the candidate set is just
+     * self, so this commits self and stays inert.
+     */
+    private fun recomputeOperator() {
+        val self = cachedSelfId ?: return // not a bridged hub yet -> no election
+        val op = operatorElection.elect(
+            selfId = self,
+            selfLoad = localLoad(),
+            peers = peerLoads,
+            now = System.currentTimeMillis(),
+        )
+        _effectiveOperatorId.value = op
+        _amIOperator.value = (op == self)
+        // Re-publish the Hub state so the (bridge-only) operator label in the
+        // notification tracks the new operator. foldBridge is a no-op without a
+        // bridge, so a plain hub's published state is untouched (zero regression).
+        if (bridge != null) _state.value = foldBridge(lastPrimaryState)
+    }
 
     /**
      * Layer-6 per-question ownership: lets a `summary_req` cross the bridge so
@@ -387,6 +441,10 @@ class MeshController private constructor(
     override suspend fun onPeerLoad(deviceId: String, load: HubLoad) {
         peerLoads[deviceId] = PeerLoad(load, System.currentTimeMillis())
         Log.d(TAG, "Peer $deviceId load: queue=${load.queueDepth} dispatched=${load.dispatchCount}")
+        // Operator-layer 2: refresh the elected operator from the new picture.
+        // Pure computation + StateFlow publish; nothing acts on the result here
+        // (routing/ownership unchanged — that is PR#9).
+        recomputeOperator()
     }
 
     /**
@@ -411,7 +469,19 @@ class MeshController private constructor(
         if (bridge == null) return primary
         if (primary !is MeshState.Hub) return primary
         val up = lastBridgeState is MeshState.Connected
-        return primary.copy(bridge = up)
+        return primary.copy(bridge = up, operatorLabel = operatorLabel())
+    }
+
+    /**
+     * Operator-layer 2: a plain readout of the elected operator for the
+     * notification — "自分" when this hub is the operator, "peer:xxxx" (short id)
+     * otherwise, or null before the first election. Bridge-only by construction:
+     * only [foldBridge] (which is a no-op without a bridge) reads it, so a plain
+     * hub never shows it (zero regression). Informational only — no behaviour.
+     */
+    private fun operatorLabel(): String? {
+        val op = _effectiveOperatorId.value ?: return null
+        return if (op == cachedSelfId) "自分" else "peer:${op.take(6)}"
     }
 
     // ---- Layer 4: AI summary (server-only) -------------------------------
@@ -678,6 +748,13 @@ class MeshController private constructor(
         // stale inter-hub socket forwarding onto a torn-down transport.
         bridge?.stop()
         bridge = null
+        // Operator-layer 2: drop the gossiped picture and the elected operator so
+        // a reconfigure starts a fresh election (a stale peer/operator must not
+        // survive a mode/host/bridge switch).
+        peerLoads.clear()
+        operatorElection.reset()
+        _effectiveOperatorId.value = null
+        _amIOperator.value = false
         _state.value = MeshState.Idle
     }
 
