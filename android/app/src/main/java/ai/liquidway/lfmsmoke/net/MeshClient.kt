@@ -182,14 +182,28 @@ class MeshClient(
                                 Log.d(TAG, "Ignoring sync_req on leaf")
                             }
                         is MessageWire.Frame.SummaryReq ->
-                            // A leaf never runs the model; the hub does. The
-                            // hub does not relay summary_req, so a leaf should
-                            // not see this — ignore defensively.
-                            Log.d(TAG, "Ignoring summary_req on leaf")
-                        // Stage-1 bridge frames + Unknown: no relay path consumes
-                        // them yet, so skip without dropping the link.
+                            if (role == Role.BRIDGE) {
+                                // Layer 6: the far hub forwarded a summary_req
+                                // across the bridge so THIS hub can also answer.
+                                // Hand it to the controller, which runs the same
+                                // per-question ownership CAS as a local request.
+                                events.onSummaryRequest(f.since, f.questionId)
+                            } else {
+                                // A leaf never runs the model; the hub does not
+                                // relay summary_req to leaves, so this is unexpected.
+                                Log.d(TAG, "Ignoring summary_req on leaf")
+                            }
+                        is MessageWire.Frame.SummaryClaim ->
+                            if (role == Role.BRIDGE) {
+                                // Layer 6: the far hub claimed a question. Record
+                                // it so this hub's pending generation stands down
+                                // (or, on a cross-ack, both answer).
+                                events.onSummaryClaim(f.questionId, f.ownerId)
+                            } else {
+                                Log.d(TAG, "Ignoring summary_claim on leaf")
+                            }
+                        // bridge_hello + Unknown: no inbound action on a client.
                         is MessageWire.Frame.BridgeHello,
-                        is MessageWire.Frame.SummaryClaim,
                         MessageWire.Frame.Unknown,
                         -> Unit
                     }

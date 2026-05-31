@@ -168,11 +168,13 @@ class MeshServer(
                             }
                         }
                         is MessageWire.Frame.SummaryReq -> {
-                            // Layer 4: the hub owns the model. onSummaryRequest
+                            // Layer 4/6: the hub owns the model. onSummaryRequest
                             // returns fast (it dispatches generation onto its
                             // own coroutine) so this read loop keeps relaying
-                            // plain chat while a summary is produced.
-                            events.onSummaryRequest(f.since)
+                            // plain chat while a summary is produced. The
+                            // questionId (layer 6) lets per-request ownership
+                            // dedup the answer to one across the bridge.
+                            events.onSummaryRequest(f.since, f.questionId)
                         }
                         is MessageWire.Frame.BridgeHello -> {
                             // This peer is another hub reached over a bridge,
@@ -196,9 +198,16 @@ class MeshServer(
                                 Log.i(TAG, "Client ${conn.id} is a bridge (deviceId=${f.deviceId}); requested backfill since=$since")
                             }
                         }
-                        // Remaining Stage-1 frame + Unknown: no relay path
-                        // consumes them yet, so skip without dropping the link.
-                        is MessageWire.Frame.SummaryClaim,
+                        is MessageWire.Frame.SummaryClaim -> {
+                            // Layer 6: a peer hub (across the bridge) claimed a
+                            // question. The controller records it so a pending
+                            // local generation stands down (or, on a cross-ack,
+                            // both answer). A plain leaf never sends this; a leaf
+                            // controller ignores it (serverMode=false).
+                            events.onSummaryClaim(f.questionId, f.ownerId)
+                        }
+                        // Unknown: no relay path consumes it; skip without
+                        // dropping the link.
                         MessageWire.Frame.Unknown,
                         -> Unit
                     }
