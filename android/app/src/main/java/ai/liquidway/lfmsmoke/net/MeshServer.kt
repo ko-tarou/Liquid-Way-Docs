@@ -202,9 +202,20 @@ class MeshServer(
                             // Layer 6: a peer hub (across the bridge) claimed a
                             // question. The controller records it so a pending
                             // local generation stands down (or, on a cross-ack,
-                            // both answer). A plain leaf never sends this; a leaf
-                            // controller ignores it (serverMode=false).
-                            events.onSummaryClaim(f.questionId, f.ownerId)
+                            // both answer).
+                            //
+                            // A claim is hub-to-hub control: accept it ONLY from a
+                            // bridge connection. We do not honour claims from a
+                            // plain leaf — an untrusted leaf forging summary_claim
+                            // frames could poison every questionId's ownership and
+                            // suppress all answers (a DoS). Same root cause as
+                            // Task #21; ignore (log only) without dropping the link,
+                            // matching the Unknown-frame tone below.
+                            if (conn.isBridge) {
+                                events.onSummaryClaim(f.questionId, f.ownerId)
+                            } else {
+                                Log.d(TAG, "Ignoring summary_claim from non-bridge client ${conn.id}")
+                            }
                         }
                         // Unknown: no relay path consumes it; skip without
                         // dropping the link.
