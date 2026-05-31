@@ -87,6 +87,10 @@ class MeshRelayJvmTest {
         var relayTransport: MeshTransport? = null,
         // This hub's stable id, stamped on its summary_claim (layer 6).
         private val deviceId: String = name,
+        // Operator-layer 3: the non-target claim fallback delay (mirrors
+        // MeshController.dispatchFallbackMs). Injectable so a test can drive it
+        // to a small/large value deterministically.
+        private val dispatchFallbackMs: Long = 600L,
     ) : MeshEvents {
         val store = ConcurrentHashMap<String, Message>()
         // Mirrors MeshController.bridgePolicy: the hub forwards across a bridge
@@ -130,6 +134,40 @@ class MeshRelayJvmTest {
         override fun localDeviceId(): String = deviceId
         override suspend fun onPeerLoad(deviceId: String, load: HubLoad) {
             peerLoads[deviceId] = load
+        }
+
+        // ---- Operator-layer 3 dispatch hint (mirrors MeshController) ------
+        // The hint this hub advertises on its outgoing hello. A test sets it to
+        // simulate "this hub is the operator and chose target X" (null = no hint).
+        @Volatile
+        var dispatchTargetToAdvertise: String? = null
+        // The deviceId this hub believes is the operator (mirrors
+        // effectiveOperatorId). A test sets it so onDispatchHint can gate on it.
+        @Volatile
+        var believedOperator: String? = null
+        // The freshest hint received from the operator + when (for staleness).
+        @Volatile
+        var receivedHint: Pair<String?, Long>? = null
+
+        override fun localDispatchTarget(): String? = dispatchTargetToAdvertise
+        override suspend fun onDispatchHint(fromDeviceId: String, target: String?) {
+            // Mirror MeshController: only the operator's hint counts; a
+            // non-operator hello (null target) must not clobber a live hint.
+            val op = believedOperator
+            if (op != null && fromDeviceId != op) return
+            receivedHint = target to System.currentTimeMillis()
+        }
+
+        // Mirrors MeshController.effectiveDispatchTarget: if this hub IS the
+        // operator it uses its OWN advertised target; otherwise the freshest
+        // received hint within the stale window (else null -> PR#6 floor).
+        private fun effectiveDispatchTarget(now: Long): String? {
+            if (believedOperator != null && believedOperator == deviceId) {
+                return dispatchTargetToAdvertise
+            }
+            val (target, seenAt) = receivedHint ?: return null
+            if (now - seenAt > OperatorElection.DEFAULT_PEER_STALE_MS) return null
+            return target
         }
 
         fun put(m: Message): Boolean {
@@ -222,6 +260,30 @@ class MeshRelayJvmTest {
         override suspend fun onSummaryRequest(since: Long, questionId: String?) {
             if (!serverMode) return // leaf never runs the model
             val qid = questionId ?: UUID.randomUUID().toString()
+            // Operator-layer 3: advisory dispatch — bias WHEN we claim, never
+            // WHETHER (the CAS below is the floor). No fresh hint or we ARE the
+            // target -> claim now; a fresh hint pointing elsewhere -> defer by
+            // dispatchFallbackMs (the target normally claims first; if it is dead
+            // we still claim after the window -> liveness).
+            val target = effectiveDispatchTarget(System.currentTimeMillis())
+            if (target != null && target != deviceId) {
+                // Forward the request to the far hub FIRST so the target can
+                // claim it, THEN defer our own claim (mirrors MeshController).
+                bridge?.let { b ->
+                    if (questionOwnership.shouldForward(qid)) {
+                        b.sendRaw(MessageWire.encodeSummaryReq(since, qid))
+                    }
+                }
+                scope.launch {
+                    kotlinx.coroutines.delay(dispatchFallbackMs)
+                    claimAndGenerate(since, qid)
+                }
+                return
+            }
+            claimAndGenerate(since, qid)
+        }
+
+        private suspend fun claimAndGenerate(since: Long, qid: String) {
             // Per-question ownership CAS: stand down if a peer already claimed.
             if (!questionOwnership.tryClaim(qid, deviceId)) return
             // Claim BEFORE forwarding the request (same ordered bridge socket),
@@ -850,11 +912,12 @@ class MeshRelayJvmTest {
     private class TwoHubFixture(
         engineA: SummarizationEngine? = null,
         engineB: SummarizationEngine? = null,
+        dispatchFallbackMs: Long = 600L,
     ) {
         // Distinct deviceIds so the layer-6 claim CAS can tell the two hubs
         // apart (a claim from "hub-B" makes "hub-A" stand down and vice versa).
-        val hubA = FakePeer("hubA", serverMode = true, engine = engineA, deviceId = "hub-A")
-        val hubB = FakePeer("hubB", serverMode = true, engine = engineB, deviceId = "hub-B")
+        val hubA = FakePeer("hubA", serverMode = true, engine = engineA, deviceId = "hub-A", dispatchFallbackMs = dispatchFallbackMs)
+        val hubB = FakePeer("hubB", serverMode = true, engine = engineB, deviceId = "hub-B", dispatchFallbackMs = dispatchFallbackMs)
         lateinit var serverA: MeshServer
         lateinit var serverB: MeshServer
         lateinit var bridge: MeshClient
@@ -862,10 +925,14 @@ class MeshRelayJvmTest {
         var leafB: MeshClient? = null
         val leafAPeer = FakePeer("leafA")
         val leafBPeer = FakePeer("leafB")
+        // Extra bridges (e.g. the B->A reverse link for the dispatch fixture) to
+        // tear down alongside the primary A->B bridge.
+        val bridgesToClose = mutableListOf<MeshClient>()
 
         fun close() = runBlocking {
             leafA?.stop(); leafB?.stop()
             bridge.stop()
+            bridgesToClose.forEach { it.stop() }
             serverA.stop(); serverB.stop()
         }
     }
@@ -873,7 +940,8 @@ class MeshRelayJvmTest {
     private fun startTwoHubs(
         engineA: SummarizationEngine? = null,
         engineB: SummarizationEngine? = null,
-    ): TwoHubFixture = TwoHubFixture(engineA, engineB).apply {
+        dispatchFallbackMs: Long = 600L,
+    ): TwoHubFixture = TwoHubFixture(engineA, engineB, dispatchFallbackMs).apply {
         serverA = startHub(hubA)
         serverB = startHub(hubB)
         hubA.localTransport = serverA
@@ -907,6 +975,35 @@ class MeshRelayJvmTest {
         // B now has leafB + bridge = 2 peers; A has leafA = 1 peer.
         await("B has 2 peers") {
             val s = serverB.state.value; s is MeshState.Hub && s.peerCount == 2
+        }
+    }
+
+    /**
+     * Operator-layer-3 dispatch fixture: like [startTwoHubs] but with a SECOND
+     * bridge B->A so a claim originating on EITHER hub reaches the other. This
+     * mirrors a deployment where every hub bridges to its peer (each hub owns its
+     * own outbound bridge), which is what lets the dispatch target's
+     * summary_claim suppress a non-target's deferred claim regardless of which
+     * hub the request was tapped on. The forward-once + seen-set guards keep the
+     * bidirectional links loop-free, so plain chat and the PR#6 floor are intact.
+     */
+    private fun startTwoHubsBidirectional(
+        engineA: SummarizationEngine? = null,
+        engineB: SummarizationEngine? = null,
+        dispatchFallbackMs: Long = 600L,
+    ): TwoHubFixture = startTwoHubs(engineA, engineB, dispatchFallbackMs).apply {
+        val bridgeB = MeshClient(
+            host = "127.0.0.1",
+            port = serverA.boundPort,
+            events = hubB,
+            role = MeshClient.Role.BRIDGE,
+            deviceId = "hub-B",
+        )
+        runBlocking { bridgeB.start() }
+        hubB.bridge = bridgeB
+        bridgesToClose.add(bridgeB)
+        await("A sees B's bridge") {
+            val s = serverA.state.value; s is MeshState.Hub && s.peerCount >= 2
         }
     }
 
@@ -1449,5 +1546,169 @@ class MeshRelayJvmTest {
         } finally {
             client?.stop(); bridge?.close(); server.stop()
         }
+    }
+
+    // ---- Operator layer 3: advisory dispatch (hint-biased claim) -----------
+    //
+    // The operator advertises a dispatchTarget (the least-loaded hub) on its
+    // bridge_hello. A hub biases claim TIMING on it: the target claims at once,
+    // a non-target defers by dispatchFallbackMs. The claim CAS (PR#6) is still
+    // the correctness floor — the hint only changes who claims first, never
+    // whether a question stays single-owned, and a dead target falls back so the
+    // answer is never lost. Hint is untrusted (Task #21); a bad hint only loses
+    // efficiency. dispatchFallbackMs is injected so timing is deterministic.
+
+    @Test
+    fun bridgeHelloRoundTripsDispatchTargetAndDefaultsNull() {
+        val withHint = MessageWire.decodeFrame(
+            MessageWire.encodeBridgeHello("op", queueDepth = 2, dispatchTarget = "hub-idle"),
+        ) as MessageWire.Frame.BridgeHello
+        assertEquals("hub-idle", withHint.dispatchTarget)
+        // No target field at all -> null (legacy / non-operator hello).
+        val none = MessageWire.decodeFrame(MessageWire.encodeBridgeHello("op"))
+                as MessageWire.Frame.BridgeHello
+        assertNull(none.dispatchTarget)
+    }
+
+    @Test
+    fun operatorDispatchHintIsGossipedAcrossTheBridgeAndRecorded() = runBlocking {
+        // The hint travels on the EXISTING hello: A (acting as operator) stamps
+        // dispatchTarget on its bridge heartbeat; B records it via onDispatchHint.
+        val f = startTwoHubs()
+        try {
+            f.hubA.dispatchTargetToAdvertise = "hub-B"
+            await("B recorded A's dispatch hint", timeoutMs = 12_000) {
+                f.hubB.receivedHint?.first == "hub-B"
+            }
+            // A non-operator (B) advertises no hint, so A records null from B's echo.
+            await("A recorded B's (null) hint", timeoutMs = 12_000) {
+                f.hubA.receivedHint != null && f.hubA.receivedHint?.first == null
+            }
+        } finally {
+            f.close()
+        }
+    }
+
+    @Test
+    fun hintTargetClaimsAndTheBusyNonTargetStandsDownLoadBalanced() = runBlocking {
+        // Operator hint points at the idle hub B. A leaf taps on the busy hub A.
+        // A is NOT the target -> it forwards the request then defers its claim.
+        // B IS the target -> it claims immediately; its claim makes A's deferred
+        // attempt stand down. Exactly ONE answer, produced by the TARGET (B).
+        val engA = FakeSummarizationEngine()
+        val engB = FakeSummarizationEngine()
+        // Bidirectional bridge so the target's claim reaches the non-target.
+        // Generous fallback so B's claim deterministically beats A's deferred try.
+        val f = startTwoHubsBidirectional(engineA = engA, engineB = engB, dispatchFallbackMs = 3_000L)
+        try {
+            // hub-A is the operator and points the hint at the idle hub-B. Both
+            // hubs agree on who the operator is; A uses its OWN target, B uses
+            // the hint it recorded from A's hello (set directly for determinism).
+            f.hubA.believedOperator = "hub-A"
+            f.hubB.believedOperator = "hub-A"
+            f.hubA.dispatchTargetToAdvertise = "hub-B"
+            f.hubB.receivedHint = "hub-B" to System.currentTimeMillis()
+            // Seed the same chat on BOTH hubs so whichever generates digests it.
+            f.hubA.put(msg("c-1", "water needed", "leafA", 1_000, MessageStatus.SENT))
+            f.hubB.put(msg("c-1", "water needed", "leafA", 1_000, MessageStatus.SENT))
+
+            assertTrue(f.leafA!!.sendRaw(MessageWire.encodeSummaryReq(questionId = "Q-bal")))
+            await("an AI summary reached A's leaf", timeoutMs = 8_000) {
+                f.leafAPeer.store.values.any { it.senderId == AI_SENDER_ID }
+            }
+            Thread.sleep(400)
+            assertEquals("exactly one hub generated", 1, engA.callCount.get() + engB.callCount.get())
+            assertEquals("the TARGET (B) generated", 1, engB.callCount.get())
+            assertEquals("the busy non-target (A) stood down", 0, engA.callCount.get())
+            assertEquals(1, f.leafAPeer.store.values.count { it.senderId == AI_SENDER_ID })
+            assertEquals(1, f.leafBPeer.store.values.count { it.senderId == AI_SENDER_ID })
+        } finally {
+            f.close()
+        }
+    }
+
+    @Test
+    fun deadHintTargetFallsBackSoTheAnswerIsNeverLost() = runBlocking {
+        // Liveness: the operator hint names a target that never claims (it is
+        // dead / unreachable). The receiving hub must still produce the answer
+        // after the fallback window — the hint can only DELAY, never DROP, a
+        // summary. Modelled with a lone hub (no bridge to the named target) so
+        // the target provably never claims.
+        val fake = FakeSummarizationEngine()
+        val hub = FakePeer(
+            "hub", serverMode = true, engine = fake, deviceId = "hub-A",
+            dispatchFallbackMs = 300L, // small but non-zero: prove fallback fires.
+        )
+        val server = startHub(hub)
+        hub.relayTransport = server
+        var client: MeshClient? = null
+        try {
+            client = MeshClient("127.0.0.1", server.boundPort, FakePeer("A"))
+            client.start()
+            await("connected") { client!!.state.value is MeshState.Connected }
+            hub.put(msg("c-1", "status ok", "A", 1_000, MessageStatus.SENT))
+            // Hint names hub-ghost (a target that does not exist here / never claims).
+            hub.receivedHint = "hub-ghost" to System.currentTimeMillis()
+
+            assertTrue(client.sendRaw(MessageWire.encodeSummaryReq(questionId = "Q-live")))
+            // No immediate answer (the hub deferred to the dead target)...
+            Thread.sleep(50)
+            assertEquals("did not claim immediately (deferred to target)", 0, fake.callCount.get())
+            // ...but after the fallback window the hub claims and the answer lands.
+            await("answer produced after fallback", timeoutMs = 5_000) {
+                hub.store.values.count { it.senderId == AI_SENDER_ID } == 1
+            }
+            assertEquals(1, fake.callCount.get())
+        } finally {
+            client?.stop(); server.stop()
+        }
+    }
+
+    @Test
+    fun staleHintRevertsToPlainPr6ImmediateClaim() = runBlocking {
+        // operator absent / hint stale -> the hub must behave exactly like PR#6:
+        // claim its local request IMMEDIATELY (no defer), single answer. We make
+        // the recorded hint stale by back-dating it past the stale window.
+        val fake = FakeSummarizationEngine()
+        val hub = FakePeer(
+            "hub", serverMode = true, engine = fake, deviceId = "hub-A",
+            dispatchFallbackMs = 5_000L, // huge: a defer here would time the test out.
+        )
+        val server = startHub(hub)
+        hub.relayTransport = server
+        var client: MeshClient? = null
+        try {
+            client = MeshClient("127.0.0.1", server.boundPort, FakePeer("A"))
+            client.start()
+            await("connected") { client!!.state.value is MeshState.Connected }
+            hub.put(msg("c-1", "status ok", "A", 1_000, MessageStatus.SENT))
+            // A hint pointing elsewhere, but older than the stale window -> ignored.
+            hub.receivedHint = "hub-B" to
+                (System.currentTimeMillis() - OperatorElection.DEFAULT_PEER_STALE_MS - 1_000L)
+
+            assertTrue(client.sendRaw(MessageWire.encodeSummaryReq(questionId = "Q-stale")))
+            // Immediate claim despite the (stale) elsewhere-hint and the huge
+            // fallback: the answer lands well before dispatchFallbackMs.
+            await("immediate PR#6 answer", timeoutMs = 2_000) {
+                hub.store.values.count { it.senderId == AI_SENDER_ID } == 1
+            }
+            assertEquals(1, fake.callCount.get())
+        } finally {
+            client?.stop(); server.stop()
+        }
+    }
+
+    @Test
+    fun hintDoesNotBreakSingleOwnershipUnderCrossAck() {
+        // Correctness floor is invariant under the hint: even if two hubs both
+        // (deferred or not) reach the claim, the CAS keeps it to at most two
+        // owners and suppresses a third — identical to PR#6. Proven on the pure
+        // ownership logic (the hint never touches it).
+        val own = QuestionOwnership()
+        assertTrue(own.tryClaim("q", "hub-A"))
+        own.onRemoteClaim("q", "hub-B")
+        assertTrue("at most two on a genuine cross-ack", own.isCrossAck("q"))
+        own.onRemoteClaim("q", "hub-C")
+        assertFalse("third suppressed regardless of any hint", own.tryClaim("q", "hub-C"))
     }
 }
