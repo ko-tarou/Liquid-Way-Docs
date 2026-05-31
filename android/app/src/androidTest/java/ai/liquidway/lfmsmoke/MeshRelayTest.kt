@@ -73,6 +73,19 @@ class MeshRelayTest {
         override suspend fun onMessage(message: Message): Boolean =
             dao.insertReturning(message) != -1L
 
+        // Stage-1 bridge unified inbound. This is a leaf-only stub with no bridge
+        // connections (fromBridge is always false here), so it behaves as a PRIMARY
+        // leaf: persist only, no fan-out (the hub owns fan-out). Delegates to the
+        // persistence path so the layer-2/3 relay assertions stay unchanged.
+        override suspend fun ingest(
+            message: Message,
+            hop: Int,
+            originId: String?,
+            fromBridge: Boolean,
+        ) {
+            onMessage(message)
+        }
+
         override suspend fun onSyncRequest(since: Long, reply: suspend (String) -> Unit) {
             dao.recentSince(since, 500).asReversed()
                 .forEach { reply(MessageWire.encodeSyncResp(it)) }
