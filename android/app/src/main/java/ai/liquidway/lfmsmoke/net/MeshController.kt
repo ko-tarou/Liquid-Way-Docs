@@ -415,9 +415,12 @@ internal suspend fun MessageRepository.markSent(id: String) =
  * [capacity] is injectable purely so a test can drive eviction with a tiny
  * bound; production uses [DEFAULT_CAPACITY].
  *
- * Thread-safety: [bridgeHopFor] is called by PR#3's relay reader off a plain
- * socket thread (not a coroutine), so a [Mutex] (suspend-only) would be wrong;
- * the [Synchronized] method below is the right primitive here.
+ * Thread-safety: PR#3's relay calls [bridgeHopFor] from each client's reader
+ * coroutine running on [Dispatchers.IO]. Multiple readers can run concurrently
+ * on different threads, so mutual exclusion is required. [Synchronized] is a
+ * non-suspending, blocking mutual-exclusion primitive — the right fit for
+ * guarding the non-thread-safe [LinkedHashMap] below, since this is a simple
+ * read-modify-write with no suspension points (more natural than a [Mutex]).
  */
 class BridgePolicy(private val capacity: Int = DEFAULT_CAPACITY) {
 
