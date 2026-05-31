@@ -132,6 +132,21 @@ class OperatorElection(
     @Synchronized
     fun current(): String? = committed
 
+    /**
+     * Forget all committed/streak state so the *next* [elect] starts from a
+     * clean slate. Call this on teardown/reconfigure: otherwise a stale
+     * incumbent (a peer that no longer exists after the reconfigure) stays in
+     * [committed], and the first post-reconfigure [elect] would treat self as a
+     * mere challenger — re-publishing the departed operator id and taking
+     * [switchHysteresis] ticks before self can reclaim the role. Resetting keeps
+     * the published operator in step with the live candidate set.
+     */
+    @Synchronized
+    fun reset() {
+        committed = null
+        resetStreak()
+    }
+
     private fun resetStreak() {
         challengerStreak = 0
         streakHolder = null

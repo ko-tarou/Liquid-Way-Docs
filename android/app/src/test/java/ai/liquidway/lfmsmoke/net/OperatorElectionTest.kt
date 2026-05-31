@@ -227,6 +227,30 @@ class OperatorElectionTest {
     }
 
     @Test
+    fun resetForgetsTheIncumbentSoSelfReclaimsImmediately() {
+        // Commit a busy peer B as operator.
+        val e = OperatorElection(switchHysteresis = 3)
+        assertEquals(
+            "hub-B",
+            e.elect("hub-A", HubLoad(0), mapOf("hub-B" to peer(HubLoad(5))), now),
+        )
+        assertEquals("hub-B", e.current())
+
+        // Reconfigure: B is gone. teardown() calls reset() to drop the stale
+        // incumbent.
+        e.reset()
+        assertNull("reset clears the committed operator", e.current())
+
+        // First post-reset election: self is the only/raw winner and must commit
+        // IMMEDIATELY, not be treated as a challenger waiting out hysteresis.
+        assertEquals(
+            "self reclaims at once without dragging the departed operator",
+            "hub-A",
+            e.elect("hub-A", HubLoad(0), emptyMap(), now),
+        )
+    }
+
+    @Test
     fun currentReflectsTheCommittedOperatorWithoutRecomputing() {
         val e = OperatorElection()
         assertNull("no election yet -> null", e.current())

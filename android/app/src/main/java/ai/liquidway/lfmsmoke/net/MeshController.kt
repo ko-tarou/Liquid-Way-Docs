@@ -752,6 +752,7 @@ class MeshController private constructor(
         // a reconfigure starts a fresh election (a stale peer/operator must not
         // survive a mode/host/bridge switch).
         peerLoads.clear()
+        operatorElection.reset()
         _effectiveOperatorId.value = null
         _amIOperator.value = false
         _state.value = MeshState.Idle
