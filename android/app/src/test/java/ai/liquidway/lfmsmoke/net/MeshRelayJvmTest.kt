@@ -91,6 +91,24 @@ class MeshRelayJvmTest {
         // through this real policy (seen-set + hop ceiling), so the loop and
         // ceiling guards exercised here are the production logic.
         val bridgePolicy = BridgePolicy()
+
+        /**
+         * Mirrors [MeshController.transport]/[MeshController.bridge] for the
+         * 2-hub E2E. `localTransport` fans out to THIS hub's leaves; `bridge` is
+         * the secondary MeshClient to the second hub (A->B). Either may be null.
+         */
+        var localTransport: MeshTransport? = null
+        var bridge: MeshClient? = null
+
+        // Same A->B chokepoint as MeshController.forwardToBridge.
+        private fun forwardToBridge(message: Message, hop: Int, originId: String?) {
+            val b = bridge ?: return
+            val nextHop = bridgePolicy.bridgeHopFor(message.id, hop) ?: return
+            val stamped = originId ?: message.senderId
+            runBlocking {
+                b.sendRaw(MessageWire.encode(message, hop = nextHop, originId = stamped))
+            }
+        }
         private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private val summaryDispatcher = Dispatchers.IO.limitedParallelism(1)
         private val summaryInFlight = AtomicBoolean(false)
@@ -107,7 +125,27 @@ class MeshRelayJvmTest {
             }
         }
 
-        override suspend fun onMessage(message: Message): Boolean = put(message)
+        override suspend fun onMessage(message: Message): Boolean {
+            val isNew = put(message)
+            // Leaf-origin on a hub also crosses to the second hub (A->B).
+            forwardToBridge(message, hop = 0, originId = null)
+            return isNew
+        }
+
+        override suspend fun ingest(
+            message: Message,
+            hop: Int,
+            originId: String?,
+            fromBridge: Boolean,
+        ) {
+            if (!fromBridge) {
+                put(message)
+                return
+            }
+            // Bridge inbound: persist, fan out to local leaves, never echo back.
+            val isNew = put(message)
+            if (isNew) localTransport?.send(message)
+        }
 
         override fun bridgeHopFor(messageId: String, hop: Int): Int? =
             bridgePolicy.bridgeHopFor(messageId, hop)
@@ -121,6 +159,9 @@ class MeshRelayJvmTest {
         }
 
         override suspend fun onLinkEstablished(transport: MeshTransport) {
+            // The bridge link is our own secondary MeshClient: it must not drive
+            // leaf-side catch-up (sync_req / outbox), same as MeshController.
+            if (transport === bridge) return
             if (transport is MeshClient) {
                 val since = store.values
                     .filter { it.status != MessageStatus.LOCAL }
@@ -736,6 +777,185 @@ class MeshRelayJvmTest {
             assertEquals(MessageStatus.SENT, bPeer.store["leaf-1"]!!.status)
         } finally {
             clientA?.stop(); clientB?.stop(); bridge?.close(); server.stop()
+        }
+    }
+
+    // ---- PR#4: 2-hub bridge E2E (real MeshClient bridge, both directions) --
+    //
+    // Topology: hub A and hub B each run a real MeshServer; A also runs a real
+    // MeshClient(role=BRIDGE) to B (single inter-hub link — only A sets it, per
+    // the operational rule). One real leaf MeshClient hangs off each hub. This
+    // is the production wiring: A->B is driven by A's controller (forwardToBridge
+    // in onMessage/sendLocal), B->A by B's MeshServer.relay to its isBridge conn.
+
+    /** Build the 2-hub fixture; returns a closer that tears everything down. */
+    private class TwoHubFixture {
+        val hubA = FakePeer("hubA", serverMode = true)
+        val hubB = FakePeer("hubB", serverMode = true)
+        lateinit var serverA: MeshServer
+        lateinit var serverB: MeshServer
+        lateinit var bridge: MeshClient
+        var leafA: MeshClient? = null
+        var leafB: MeshClient? = null
+        val leafAPeer = FakePeer("leafA")
+        val leafBPeer = FakePeer("leafB")
+
+        fun close() = runBlocking {
+            leafA?.stop(); leafB?.stop()
+            bridge.stop()
+            serverA.stop(); serverB.stop()
+        }
+    }
+
+    private fun startTwoHubs(): TwoHubFixture = TwoHubFixture().apply {
+        serverA = startHub(hubA)
+        serverB = startHub(hubB)
+        hubA.localTransport = serverA
+        hubB.localTransport = serverB
+        // A bridges to B. A's bridge MeshClient announces itself, so B marks the
+        // connection isBridge=true and forwards across it (the B->A direction).
+        bridge = MeshClient(
+            host = "127.0.0.1",
+            port = serverB.boundPort,
+            events = hubA,
+            role = MeshClient.Role.BRIDGE,
+            deviceId = "hub-A",
+        )
+        runBlocking { bridge.start() }
+        hubA.bridge = bridge
+        // Wait until B sees the bridge connection.
+        await("B sees bridge") {
+            val s = serverB.state.value; s is MeshState.Hub && s.peerCount >= 1
+        }
+        // One real leaf per hub.
+        leafA = MeshClient("127.0.0.1", serverA.boundPort, leafAPeer)
+            .also { runBlocking { it.start() } }
+        leafB = MeshClient("127.0.0.1", serverB.boundPort, leafBPeer)
+            .also { runBlocking { it.start() } }
+        await("leaf A connected") { leafA!!.state.value is MeshState.Connected }
+        await("leaf B connected") { leafB!!.state.value is MeshState.Connected }
+        // B now has leafB + bridge = 2 peers; A has leafA = 1 peer.
+        await("B has 2 peers") {
+            val s = serverB.state.value; s is MeshState.Hub && s.peerCount == 2
+        }
+    }
+
+    @Test
+    fun aLeafMessageReachesBLeafExactlyOnceAcrossTheBridge() = runBlocking {
+        val f = startTwoHubs()
+        try {
+            // Leaf on A speaks; it must surface on B's leaf exactly once.
+            assertTrue(f.leafA!!.send(msg("a2b-1", "from A side", "device-A")))
+            await("B leaf got it") { f.leafBPeer.store.containsKey("a2b-1") }
+            // Give any erroneous echo time to (wrongly) arrive, then assert once.
+            Thread.sleep(300)
+            assertEquals("from A side", f.leafBPeer.store["a2b-1"]!!.body)
+            // Hub A and hub B both stored it exactly once (dedup) and A's leaf
+            // (the sender) was excluded from its own hub's fan-out, so no dup.
+            assertTrue(f.hubA.store.containsKey("a2b-1"))
+            assertTrue(f.hubB.store.containsKey("a2b-1"))
+            assertEquals(1, f.hubB.store.values.count { it.id == "a2b-1" })
+        } finally {
+            f.close()
+        }
+    }
+
+    @Test
+    fun bLeafMessageReachesALeafExactlyOnceAcrossTheBridge() = runBlocking {
+        val f = startTwoHubs()
+        try {
+            // Leaf on B speaks; B->A is carried by B's MeshServer.relay to the
+            // isBridge connection, received by A's bridge MeshClient, fanned out
+            // to A's leaves by hubA.ingest(fromBridge=true).
+            assertTrue(f.leafB!!.send(msg("b2a-1", "from B side", "device-B")))
+            await("A leaf got it") { f.leafAPeer.store.containsKey("b2a-1") }
+            Thread.sleep(300)
+            assertEquals("from B side", f.leafAPeer.store["b2a-1"]!!.body)
+            assertEquals(1, f.leafAPeer.store.values.count { it.id == "b2a-1" })
+            assertTrue(f.hubA.store.containsKey("b2a-1"))
+            assertTrue(f.hubB.store.containsKey("b2a-1"))
+        } finally {
+            f.close()
+        }
+    }
+
+    @Test
+    fun bridgeRoleClientAnnouncesItselfSoTheFarHubMarksItABridge() = runBlocking {
+        // A BRIDGE-role MeshClient must send a bridge_hello on connect; the far
+        // hub then routes a leaf-authored msg across it via the forwarding
+        // policy (hop 0 -> 1, origin stamped). If the hello were missing, the
+        // hub would treat the link as a plain leaf and fan out hop-0 / no origin.
+        val hub = FakePeer("hub")
+        val server = startHub(hub)
+        var leaf: MeshClient? = null
+        var bridge: MeshClient? = null
+        try {
+            val port = server.boundPort
+            bridge = MeshClient(
+                host = "127.0.0.1",
+                port = port,
+                events = FakePeer("bridgeSide"),
+                role = MeshClient.Role.BRIDGE,
+                deviceId = "hub-far",
+            )
+            bridge.start()
+            await("hub saw bridge") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 1
+            }
+            // Capture exactly what the bridge link receives from the hub.
+            val received = java.util.concurrent.CopyOnWriteArrayList<MessageWire.Frame.Msg>()
+            val bridgeSink = object : MeshEvents {
+                override suspend fun onMessage(message: Message) = true
+                override suspend fun ingest(message: Message, hop: Int, originId: String?, fromBridge: Boolean) {
+                    received.add(MessageWire.Frame.Msg(message, hop, originId))
+                }
+                override suspend fun onSyncRequest(since: Long, reply: suspend (String) -> Unit) {}
+                override suspend fun onLinkEstablished(transport: MeshTransport) {}
+                override suspend fun onSummaryRequest(since: Long) {}
+                override fun bridgeHopFor(messageId: String, hop: Int): Int? = null
+            }
+            // Re-point the bridge through a fresh client wired to the sink so we
+            // can read the forwarded envelope (hop/origin) on this side.
+            bridge.stop()
+            bridge = MeshClient("127.0.0.1", port, bridgeSink, MeshClient.Role.BRIDGE, "hub-far")
+            bridge.start()
+            await("hub saw bridge #2") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 1
+            }
+            leaf = MeshClient("127.0.0.1", port, FakePeer("leaf")).also { it.start() }
+            await("2 peers") {
+                val s = server.state.value; s is MeshState.Hub && s.peerCount == 2
+            }
+            assertTrue(leaf.send(msg("hello-test", "x", "device-A")))
+            await("bridge got forwarded") { received.any { it.message.id == "hello-test" } }
+            val f = received.first { it.message.id == "hello-test" }
+            assertEquals("hop incremented (proves isBridge via hello)", 1, f.hop)
+            assertEquals("device-A", f.originId)
+        } finally {
+            leaf?.stop(); bridge?.stop(); server.stop()
+        }
+    }
+
+    @Test
+    fun bridgedMessageDoesNotLoopOrDuplicate() = runBlocking {
+        val f = startTwoHubs()
+        try {
+            // Fire from both sides; each must land on the far leaf exactly once
+            // and never ping-pong back (no growth in counts after settling).
+            assertTrue(f.leafA!!.send(msg("loop-a", "ping A", "device-A")))
+            assertTrue(f.leafB!!.send(msg("loop-b", "ping B", "device-B")))
+            await("A's msg on B") { f.leafBPeer.store.containsKey("loop-a") }
+            await("B's msg on A") { f.leafAPeer.store.containsKey("loop-b") }
+            // Let any echo circulate, then assert single delivery everywhere.
+            Thread.sleep(400)
+            assertEquals(1, f.leafBPeer.store.values.count { it.id == "loop-a" })
+            assertEquals(1, f.leafAPeer.store.values.count { it.id == "loop-b" })
+            assertEquals(1, f.hubA.store.values.count { it.id == "loop-a" })
+            assertEquals(1, f.hubB.store.values.count { it.id == "loop-a" })
+            assertEquals(1, f.hubA.store.values.count { it.id == "loop-b" })
+            assertEquals(1, f.hubB.store.values.count { it.id == "loop-b" })
+        } finally {
+            f.close()
         }
     }
 }
