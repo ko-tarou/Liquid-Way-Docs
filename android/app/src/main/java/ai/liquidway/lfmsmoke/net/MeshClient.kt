@@ -213,6 +213,10 @@ class MeshClient(
                                     f.deviceId,
                                     HubLoad(f.queueDepth, f.dispatchCount),
                                 )
+                                // Operator-layer 3: record the advisory dispatch
+                                // hint the far hub piggybacked (null unless it is
+                                // the operator). Biases claim timing only.
+                                events.onDispatchHint(f.deviceId, f.dispatchTarget)
                             } else Unit
                         // Unknown: no inbound action on a client.
                         MessageWire.Frame.Unknown,
@@ -265,6 +269,10 @@ class MeshClient(
             deviceId = deviceId ?: "bridge",
             queueDepth = load.queueDepth,
             dispatchCount = load.dispatchCount,
+            // Operator-layer 3: piggyback the advisory dispatch hint (null unless
+            // this hub is the operator). Sampled per-send so each heartbeat
+            // carries the freshest target — no new frame, no new timer.
+            dispatchTarget = events.localDispatchTarget(),
         )
     }
 

@@ -192,6 +192,12 @@ class MeshServer(
                                 f.deviceId,
                                 HubLoad(f.queueDepth, f.dispatchCount),
                             )
+                            // Operator-layer 3: record the advisory dispatch hint
+                            // the peer hub piggybacked (null unless it is the
+                            // operator), then echo our OWN hint back so it flows
+                            // both ways. Timing bias only — never affects single
+                            // ownership.
+                            events.onDispatchHint(f.deviceId, f.dispatchTarget)
                             val mine = events.localLoad()
                             writeTo(
                                 conn,
@@ -199,6 +205,7 @@ class MeshServer(
                                     deviceId = events.localDeviceId(),
                                     queueDepth = mine.queueDepth,
                                     dispatchCount = mine.dispatchCount,
+                                    dispatchTarget = events.localDispatchTarget(),
                                 ),
                             )
                             // FIRST hello only: flip to bridge AND kick partition

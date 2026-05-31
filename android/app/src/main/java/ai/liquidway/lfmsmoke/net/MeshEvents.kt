@@ -152,11 +152,35 @@ interface MeshEvents {
 
     /**
      * Operator-layer: a peer hub reported its [load] on a bridge_hello. The
-     * receiver records it in a per-peer view keyed by [deviceId]. This is a
-     * read-only signal in this PR (no routing decision consumes it yet);
-     * operator selection / dispatch hints are a later PR.
+     * receiver records it in a per-peer view keyed by [deviceId]. Feeds the
+     * deterministic operator election; nothing routes on it directly.
      *
      * Default no-op so non-hub stand-ins need not override it.
      */
     suspend fun onPeerLoad(deviceId: String, load: HubLoad) {}
+
+    /**
+     * Operator-layer 3: the dispatch hint this hub advertises on its OUTGOING
+     * bridge_hello (and the echoed hello). Non-null ONLY when this hub is the
+     * elected operator and has computed a least-loaded target; null otherwise
+     * (a non-operator hub never emits a hint). It is purely a *timing* hint — it
+     * biases which hub claims first, never whether a question stays single-owned.
+     *
+     * Default null so a leaf-only / pre-dispatch stand-in advertises no hint.
+     */
+    fun localDispatchTarget(): String? = null
+
+    /**
+     * Operator-layer 3: a peer hub's bridge_hello carried a dispatch hint
+     * ([target], the deviceId it wants to claim a new summary). [fromDeviceId] is
+     * the advertising hub. The receiver records the freshest hint so its next
+     * [onSummaryRequest] can bias claim timing toward [target]. A null [target]
+     * means the sender retracted/has no hint.
+     *
+     * SECURITY: [fromDeviceId]/[target] are the peer's untrusted self-report; a
+     * malicious peer could steer the hint, but the claim CAS still guarantees
+     * single ownership and liveness (worst case: efficiency drops). Identity
+     * verification is future work (Task #21). Default no-op for stand-ins.
+     */
+    suspend fun onDispatchHint(fromDeviceId: String, target: String?) {}
 }

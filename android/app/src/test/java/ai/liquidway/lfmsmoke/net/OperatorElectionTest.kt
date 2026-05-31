@@ -257,4 +257,95 @@ class OperatorElectionTest {
         e.elect("hub-A", HubLoad(0), emptyMap(), now)
         assertEquals("hub-A", e.current())
     }
+
+    // ---- Operator-layer 3: dispatch target (advisory least-loaded pick) -----
+    //
+    // The dispatch hint is the mirror image of the election: the operator points
+    // new work at the LEAST loaded live hub. Pure total-order function, so it is
+    // deterministic and cross-hub-stable. It only biases claim TIMING — these
+    // tests prove the selection, not correctness (the CAS guards that).
+
+    @Test
+    fun dispatchTargetIsTheLeastLoadedHub() {
+        val target = DispatchTarget.choose(
+            selfId = "hub-A",
+            selfLoad = HubLoad(queueDepth = 5),
+            peers = mapOf(
+                "hub-B" to peer(HubLoad(queueDepth = 1)),
+                "hub-C" to peer(HubLoad(queueDepth = 3)),
+            ),
+            now = now,
+        )
+        assertEquals("idlest hub (B) is the dispatch target", "hub-B", target)
+    }
+
+    @Test
+    fun dispatchTargetTieIsBrokenByLexicographicallySmallestDeviceId() {
+        val target = DispatchTarget.choose(
+            selfId = "hub-Z",
+            selfLoad = HubLoad(queueDepth = 0),
+            peers = mapOf(
+                "hub-M" to peer(HubLoad(queueDepth = 0)),
+                "hub-A" to peer(HubLoad(queueDepth = 0)),
+            ),
+            now = now,
+        )
+        assertEquals("all idle -> smallest id wins", "hub-A", target)
+    }
+
+    @Test
+    fun dispatchTargetCanBeSelfWhenSelfIsIdlest() {
+        val target = DispatchTarget.choose(
+            selfId = "hub-A",
+            selfLoad = HubLoad(queueDepth = 0),
+            peers = mapOf("hub-B" to peer(HubLoad(queueDepth = 4))),
+            now = now,
+        )
+        assertEquals("operator points work at itself when it is idlest", "hub-A", target)
+    }
+
+    @Test
+    fun dispatchTargetIsNullWithNoLivePeers() {
+        // A lone hub needs no hint: it is trivially its own target and claims now.
+        assertNull(DispatchTarget.choose("hub-A", HubLoad(0), emptyMap(), now))
+        // A peer older than the stale window is aged out -> no live peer -> null.
+        assertNull(
+            DispatchTarget.choose(
+                selfId = "hub-A",
+                selfLoad = HubLoad(0),
+                peers = mapOf("hub-B" to peer(HubLoad(0), ageMs = 20_000L)),
+                now = now,
+                staleMs = 15_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun dispatchTargetAllHubsAgreeFromTheSamePicture() {
+        // Same global picture from each hub's vantage -> identical target (the
+        // split-brain-free property, mirrored for the hint).
+        val la = HubLoad(queueDepth = 4)
+        val lb = HubLoad(queueDepth = 1)
+        val lc = HubLoad(queueDepth = 1)
+        val fromA = DispatchTarget.choose("hub-A", la, mapOf("hub-B" to peer(lb), "hub-C" to peer(lc)), now)
+        val fromB = DispatchTarget.choose("hub-B", lb, mapOf("hub-A" to peer(la), "hub-C" to peer(lc)), now)
+        val fromC = DispatchTarget.choose("hub-C", lc, mapOf("hub-A" to peer(la), "hub-B" to peer(lb)), now)
+        assertEquals("idlest, tie to smallest id", "hub-B", fromA)
+        assertEquals(fromA, fromB)
+        assertEquals(fromB, fromC)
+    }
+
+    @Test
+    fun dispatchTargetClampsUntrustedQueueDepth() {
+        // A peer self-reporting a negative depth cannot appear "more idle" than 0.
+        val target = DispatchTarget.choose(
+            selfId = "hub-A",
+            selfLoad = HubLoad(queueDepth = 0),
+            peers = mapOf("hub-B" to peer(HubLoad(queueDepth = -100))),
+            now = now,
+        )
+        // B clamps to 0, tying with self (also 0) -> smaller id "hub-A" wins;
+        // the spoofed negative did NOT let B steal the target slot for free.
+        assertEquals("hub-A", target)
+    }
 }
