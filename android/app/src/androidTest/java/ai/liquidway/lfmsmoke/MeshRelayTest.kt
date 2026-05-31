@@ -106,7 +106,7 @@ class MeshRelayTest {
         // Layer-4 hook: this layer-2/3 instrumented test does not exercise AI
         // summarisation (covered deterministically in MeshRelayJvmTest), so a
         // no-op satisfies the interface without changing this test's scope.
-        override suspend fun onSummaryRequest(since: Long) = Unit
+        override suspend fun onSummaryRequest(since: Long, questionId: String?) = Unit
 
         // Stage-1 bridge: this leaf-only test has no bridge connections, so the
         // hop policy is never consulted; a never-forward stub satisfies the
