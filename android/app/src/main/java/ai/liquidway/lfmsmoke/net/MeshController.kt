@@ -278,6 +278,19 @@ class MeshController private constructor(
         return built
     }
 
+    // ---- Stage-1 bridge: forwarding policy (loop prevention) -------------
+
+    /**
+     * Loop-prevention policy for the future 2-hub bridge. Pure state machine,
+     * owned by the controller but kept as its own object so it has no Room /
+     * Context dependency and can be unit-tested directly. PR#3's relay will ask
+     * [BridgePolicy.bridgeHopFor] before forwarding a message across a bridge.
+     *
+     * Not consulted by any relay path in this PR: the star topology is
+     * unchanged. This is dead-code-until-wired, validated only by unit tests.
+     */
+    val bridgePolicy = BridgePolicy()
+
     // ---- Outbox ----------------------------------------------------------
 
     /**
@@ -382,3 +395,76 @@ class MeshController private constructor(
 /** Status flip helper kept next to the controller for cohesion. */
 internal suspend fun MessageRepository.markSent(id: String) =
     updateStatus(id, MessageStatus.SENT)
+
+/**
+ * Stage-1 bridge forwarding policy: stops a message from ping-ponging across an
+ * inter-hub bridge forever. Two independent guards:
+ *
+ *  1. **Seen-set (primary loop break)** — a bounded set (FIFO eviction) of
+ *     message ids THIS device has already forwarded across the bridge. A second
+ *     appearance of the same id is refused, severing the A->B->A echo.
+ *  2. **[MAX_HOP] ceiling (belt-and-braces)** — a hard cap on bridge crossings
+ *     so even a dedup miss cannot let hop run away.
+ *
+ * NOTE — this is NOT the DAO's OnConflict.IGNORE dedup. That dedup stops a
+ * *duplicate store* (an id is never persisted twice). This seen-set stops a
+ * *re-forward across the bridge* (an id is never sent over the bridge twice).
+ * Different resources; neither subsumes the other.
+ *
+ * Pure logic with no Room / Context dependency, so it is unit-tested directly.
+ * [capacity] is injectable purely so a test can drive eviction with a tiny
+ * bound; production uses [DEFAULT_CAPACITY].
+ *
+ * Thread-safety: PR#3's relay calls [bridgeHopFor] from each client's reader
+ * coroutine running on [Dispatchers.IO]. Multiple readers can run concurrently
+ * on different threads, so mutual exclusion is required. [Synchronized] is a
+ * non-suspending, blocking mutual-exclusion primitive — the right fit for
+ * guarding the non-thread-safe [LinkedHashMap] below, since this is a simple
+ * read-modify-write with no suspension points (more natural than a [Mutex]).
+ */
+class BridgePolicy(private val capacity: Int = DEFAULT_CAPACITY) {
+
+    // Bounded FIFO of forwarded ids: removeEldestEntry drops the oldest once
+    // capacity is exceeded. Each id is put at most once (a repeat is refused
+    // before the put), so insertion order is the eviction order.
+    private val seen = object : LinkedHashMap<String, Boolean>(16, 0.75f, false) {
+        override fun removeEldestEntry(eldest: Map.Entry<String, Boolean>): Boolean =
+            size > capacity
+    }
+
+    /**
+     * Decide whether to forward [messageId] across a bridge, and at what hop.
+     * Pure decision plus one side effect: recording the id in the seen-set. It
+     * never touches the transport. PR#3's relay calls this and, on a non-null
+     * result, frames the message onto the bridge stamped with the returned hop.
+     *
+     * @return [hop] + 1 (the hop to stamp on the forwarded frame), or null to
+     *   NOT forward — either because this id was already forwarded (loop break)
+     *   or because [hop] has reached [MAX_HOP] (ceiling guard).
+     */
+    @Synchronized
+    fun bridgeHopFor(messageId: String, hop: Int): Int? {
+        if (seen.containsKey(messageId)) return null
+        if (hop >= MAX_HOP) return null
+        seen[messageId] = true
+        return hop + 1
+    }
+
+    companion object {
+        /**
+         * Maximum bridge crossings a message may make. In a 2-hub bridge a
+         * legitimate message crosses at most once (hop 0 -> 1), so a ceiling of
+         * 2 is a generous safety net behind the seen-set. Lives here (not on the
+         * wire) because it is a forwarding-policy decision, not frame format.
+         */
+        const val MAX_HOP = 2
+
+        /**
+         * Default seen-set capacity. Bounds memory to this many recently
+         * forwarded ids; older ones fall out. An evicted id could in theory be
+         * re-forwarded, but only long after any in-flight echo could still be
+         * circulating, so it is harmless for loop control.
+         */
+        const val DEFAULT_CAPACITY = 2048
+    }
+}
