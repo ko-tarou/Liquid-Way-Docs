@@ -183,6 +183,24 @@ class MeshServer(
                             // plain leaf fan-out. deviceId is logged only;
                             // ownership/identity checks land in a later PR.
                             conn.lastBridgeSeenAt = System.currentTimeMillis()
+                            // Operator-layer: record the load this peer hub
+                            // piggybacked, and echo our OWN load back on the same
+                            // connection so load is shared BOTH ways. This rides
+                            // the peer's existing heartbeat (one echo per inbound
+                            // hello) — no new frame, no new timer on the B side.
+                            events.onPeerLoad(
+                                f.deviceId,
+                                HubLoad(f.queueDepth, f.dispatchCount),
+                            )
+                            val mine = events.localLoad()
+                            writeTo(
+                                conn,
+                                MessageWire.encodeBridgeHello(
+                                    deviceId = events.localDeviceId(),
+                                    queueDepth = mine.queueDepth,
+                                    dispatchCount = mine.dispatchCount,
+                                ),
+                            )
                             // FIRST hello only: flip to bridge AND kick partition
                             // recovery (A->B). We send sync_req(ourWatermark) back
                             // on this same connection; the far hub answers it via

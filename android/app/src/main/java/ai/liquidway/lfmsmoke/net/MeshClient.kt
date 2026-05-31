@@ -140,7 +140,7 @@ class MeshClient(
             // Sent inline before onLinkEstablished so the hello is the first
             // line the far hub reads on this connection.
             if (role == Role.BRIDGE) {
-                sendRaw(MessageWire.encodeBridgeHello(deviceId ?: "bridge"))
+                sendRaw(helloLine())
                 startHeartbeat()
             }
 
@@ -202,8 +202,19 @@ class MeshClient(
                             } else {
                                 Log.d(TAG, "Ignoring summary_claim on leaf")
                             }
-                        // bridge_hello + Unknown: no inbound action on a client.
-                        is MessageWire.Frame.BridgeHello,
+                        is MessageWire.Frame.BridgeHello ->
+                            if (role == Role.BRIDGE) {
+                                // Operator-layer: the far hub echoed its own hello
+                                // with its load piggybacked. Record it so load is
+                                // shared in BOTH directions (A learns B's load
+                                // here; B learns A's from A's heartbeat). Read-only
+                                // view; no routing consumes it yet.
+                                events.onPeerLoad(
+                                    f.deviceId,
+                                    HubLoad(f.queueDepth, f.dispatchCount),
+                                )
+                            } else Unit
+                        // Unknown: no inbound action on a client.
                         MessageWire.Frame.Unknown,
                         -> Unit
                     }
@@ -236,9 +247,25 @@ class MeshClient(
         heartbeatJob = scope.launch {
             while (isActive) {
                 delay(BRIDGE_HEARTBEAT_MS)
-                if (!sendRaw(MessageWire.encodeBridgeHello(deviceId ?: "bridge"))) break
+                if (!sendRaw(helloLine())) break
             }
         }
+    }
+
+    /**
+     * BRIDGE hello, with this hub's current operator-layer load piggybacked. The
+     * load is sampled per-send via [MeshEvents.localLoad] so each heartbeat
+     * carries the up-to-date queue depth / dispatch count — no extra frame, no
+     * extra timer (it rides the existing 5s heartbeat). For a PRIMARY leaf this
+     * is never called.
+     */
+    private fun helloLine(): String {
+        val load = events.localLoad()
+        return MessageWire.encodeBridgeHello(
+            deviceId = deviceId ?: "bridge",
+            queueDepth = load.queueDepth,
+            dispatchCount = load.dispatchCount,
+        )
     }
 
     override suspend fun send(message: Message): Boolean =

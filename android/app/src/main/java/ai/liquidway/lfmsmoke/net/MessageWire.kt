@@ -107,10 +107,26 @@ object MessageWire {
         data class SummaryReq(val since: Long, val questionId: String? = null) : Frame
 
         /**
-         * Stage-1 bridge: a hub's self-announcement across a bridge link.
-         * Decode/encode only — not yet wired into any transport path.
+         * Stage-1 bridge: a hub's self-announcement across a bridge link, also
+         * serving as the inter-hub liveness heartbeat.
+         *
+         * [queueDepth] and [dispatchCount] are the operator-layer load metrics
+         * piggybacked on the existing heartbeat (no new frame, no new timer):
+         *  - [queueDepth]    : how busy this hub's summariser is right now
+         *                      (in-flight summaries; 0 when idle).
+         *  - [dispatchCount] : how many summaries this hub has produced in total
+         *                      (a monotonic counter for future load-based hints).
+         *
+         * Both are optional and default to 0, so a legacy hello (or a pre-metrics
+         * peer) that omits them decodes cleanly as "idle / unknown load". They are
+         * a shared *view* only — this PR does not route on them; operator
+         * selection / dispatch hints land in a later PR.
          */
-        data class BridgeHello(val deviceId: String) : Frame
+        data class BridgeHello(
+            val deviceId: String,
+            val queueDepth: Int = 0,
+            val dispatchCount: Int = 0,
+        ) : Frame
 
         /**
          * Stage-1 bridge: ownership claim for answering [questionId], asserted by
@@ -160,9 +176,23 @@ object MessageWire {
         return json.toString() + "\n"
     }
 
-    /** Serialises a Stage-1 [TYPE_BRIDGE_HELLO] hub self-announcement. */
-    fun encodeBridgeHello(deviceId: String): String =
-        JSONObject().put("type", TYPE_BRIDGE_HELLO).put("deviceId", deviceId).toString() + "\n"
+    /**
+     * Serialises a Stage-1 [TYPE_BRIDGE_HELLO] hub self-announcement, with the
+     * operator-layer load metrics [queueDepth]/[dispatchCount] piggybacked. Both
+     * default to 0 so an idle hub (and existing call sites) emit the same shape
+     * as before plus two zero fields a legacy peer simply ignores.
+     */
+    fun encodeBridgeHello(
+        deviceId: String,
+        queueDepth: Int = 0,
+        dispatchCount: Int = 0,
+    ): String =
+        JSONObject()
+            .put("type", TYPE_BRIDGE_HELLO)
+            .put("deviceId", deviceId)
+            .put("queueDepth", queueDepth)
+            .put("dispatchCount", dispatchCount)
+            .toString() + "\n"
 
     /** Serialises a Stage-1 [TYPE_SUMMARY_CLAIM] ownership assertion. */
     fun encodeSummaryClaim(questionId: String, ownerId: String): String =
@@ -222,7 +252,12 @@ object MessageWire {
                     json.optLong("since", 0L),
                     json.optStringOrNull("questionId"),
                 )
-                TYPE_BRIDGE_HELLO -> Frame.BridgeHello(json.getString("deviceId"))
+                TYPE_BRIDGE_HELLO -> Frame.BridgeHello(
+                    json.getString("deviceId"),
+                    // Absent on a legacy / pre-metrics hello -> idle (0) load.
+                    queueDepth = json.optInt("queueDepth", 0),
+                    dispatchCount = json.optInt("dispatchCount", 0),
+                )
                 TYPE_SUMMARY_CLAIM -> Frame.SummaryClaim(
                     json.getString("questionId"),
                     json.getString("ownerId"),

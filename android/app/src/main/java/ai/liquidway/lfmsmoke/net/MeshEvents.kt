@@ -3,6 +3,18 @@ package ai.liquidway.lfmsmoke.net
 import ai.liquidway.lfmsmoke.data.Message
 
 /**
+ * Operator-layer load snapshot a hub piggybacks on its bridge heartbeat.
+ *
+ *  - [queueDepth]    : how busy this hub's summariser is right now (in-flight
+ *                      summaries; 0 when idle). A cheap "current pressure" gauge.
+ *  - [dispatchCount] : total summaries this hub has produced so far (monotonic).
+ *
+ * Shared as a *view* only in this PR — nothing routes on it yet; load-based
+ * operator selection / dispatch hints are a later PR.
+ */
+data class HubLoad(val queueDepth: Int = 0, val dispatchCount: Int = 0)
+
+/**
  * The policy hooks a layer-2 transport calls into. All persistence, dedup,
  * outbox-flush and backfill logic lives behind this interface (implemented by
  * [MeshController]) so the transports stay dumb pipes.
@@ -118,4 +130,33 @@ interface MeshEvents {
      * need not override it.
      */
     suspend fun bridgeWatermark(): Long = 0L
+
+    /**
+     * Operator-layer: this hub's CURRENT load, stamped onto every outgoing
+     * bridge_hello (the heartbeat) so the far hub can see it for free — no extra
+     * frame or timer. Called from a BRIDGE [MeshClient] on each (re)connect and
+     * heartbeat, and from the hub's [MeshServer] when it echoes a hello back.
+     *
+     * Default [HubLoad] (0,0) so a leaf-only / pre-metrics stand-in reports
+     * "idle, no dispatches" without overriding anything.
+     */
+    fun localLoad(): HubLoad = HubLoad()
+
+    /**
+     * Operator-layer: this hub's stable deviceId, stamped on the bridge_hello
+     * the [MeshServer] echoes back so the far hub keys the load under the right
+     * peer. Default "hub" before the controller resolves its real id (rare;
+     * resolved on configure of a bridged hub).
+     */
+    fun localDeviceId(): String = "hub"
+
+    /**
+     * Operator-layer: a peer hub reported its [load] on a bridge_hello. The
+     * receiver records it in a per-peer view keyed by [deviceId]. This is a
+     * read-only signal in this PR (no routing decision consumes it yet);
+     * operator selection / dispatch hints are a later PR.
+     *
+     * Default no-op so non-hub stand-ins need not override it.
+     */
+    suspend fun onPeerLoad(deviceId: String, load: HubLoad) {}
 }
