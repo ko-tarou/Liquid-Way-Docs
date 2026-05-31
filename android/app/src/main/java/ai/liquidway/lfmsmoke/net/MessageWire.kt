@@ -118,14 +118,23 @@ object MessageWire {
          *                      (a monotonic counter for future load-based hints).
          *
          * Both are optional and default to 0, so a legacy hello (or a pre-metrics
-         * peer) that omits them decodes cleanly as "idle / unknown load". They are
-         * a shared *view* only — this PR does not route on them; operator
-         * selection / dispatch hints land in a later PR.
+         * peer) that omits them decodes cleanly as "idle / unknown load".
+         *
+         * [dispatchTarget] is the operator-layer-3 advisory dispatch hint: the
+         * deviceId of the hub the SENDING hub (when it is the elected operator)
+         * believes should preferentially claim a new summary — i.e. the least
+         * loaded hub. It is OPTIONAL and null when the sender is not the operator
+         * or has no opinion, so a legacy / non-operator hello omits it and decodes
+         * as null. It is ONLY a hint: it biases *when* a hub tries to claim, never
+         * *whether* a question ends up single-owned — the claim CAS
+         * ([QuestionOwnership]) remains the correctness floor regardless of the
+         * hint's value.
          */
         data class BridgeHello(
             val deviceId: String,
             val queueDepth: Int = 0,
             val dispatchCount: Int = 0,
+            val dispatchTarget: String? = null,
         ) : Frame
 
         /**
@@ -186,13 +195,18 @@ object MessageWire {
         deviceId: String,
         queueDepth: Int = 0,
         dispatchCount: Int = 0,
-    ): String =
-        JSONObject()
+        dispatchTarget: String? = null,
+    ): String {
+        val json = JSONObject()
             .put("type", TYPE_BRIDGE_HELLO)
             .put("deviceId", deviceId)
             .put("queueDepth", queueDepth)
             .put("dispatchCount", dispatchCount)
-            .toString() + "\n"
+        // Omitted entirely when the sender has no hint (not the operator), so a
+        // legacy peer and the absence of a hint decode identically as null.
+        if (dispatchTarget != null) json.put("dispatchTarget", dispatchTarget)
+        return json.toString() + "\n"
+    }
 
     /** Serialises a Stage-1 [TYPE_SUMMARY_CLAIM] ownership assertion. */
     fun encodeSummaryClaim(questionId: String, ownerId: String): String =
@@ -257,6 +271,8 @@ object MessageWire {
                     // Absent on a legacy / pre-metrics hello -> idle (0) load.
                     queueDepth = json.optInt("queueDepth", 0),
                     dispatchCount = json.optInt("dispatchCount", 0),
+                    // Absent on a legacy / non-operator hello -> no hint (null).
+                    dispatchTarget = json.optStringOrNull("dispatchTarget"),
                 )
                 TYPE_SUMMARY_CLAIM -> Frame.SummaryClaim(
                     json.getString("questionId"),
